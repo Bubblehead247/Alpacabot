@@ -1,0 +1,6 @@
+alpaca.env
+.env
+API.txt
+*.log
+__pycache__/
+*.pyc

@@ -1,0 +1,4 @@
+alpaca-py
+ta
+pandas
+schedule
