@@ -11,6 +11,7 @@ import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 import config
 from indicators import sma, rsi, atr
@@ -30,11 +31,15 @@ def fetch_bars(symbol: str, lookback_days: int = config.LOOKBACK_DAYS) -> pd.Dat
     end   = datetime.now(timezone.utc)
     start = end - timedelta(days=int(lookback_days * 1.6))
 
+    # feed=IEX is required on the free Alpaca data plan — the default SIP feed
+    # returns 401/"subscription does not permit recent SIP data". IEX is a single
+    # exchange but its bars are sufficient for daily-bar mean-reversion signals.
     request = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
+        feed=DataFeed.IEX,
     )
 
     bars = _data_client.get_stock_bars(request).df

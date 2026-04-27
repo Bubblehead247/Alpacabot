@@ -34,8 +34,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Pending Signal Queue ──────────────────────────────────────────────────────
-# Populated by post_close_scan(), consumed by pre_open_execute()
+# Populated by post_close_scan(), consumed by pre_open_execute().
+# Each scan starts by clearing this list, so a weekend or holiday scan can't
+# leave stale signals around to fire on the next trading day's open.
 _pending: list[dict] = []
+
+
+# ── Market-Day Guard ──────────────────────────────────────────────────────────
+# `schedule.every().day.at(...)` fires every calendar day, including Saturdays,
+# Sundays, and US market holidays. Wrapping each job with this guard makes every
+# job a no-op on non-trading days, so we don't waste API calls scanning stale
+# data or submit orders that the exchange will reject.
+
+def _skip_if_closed(job_name: str) -> bool:
+    """Returns True (and logs) if today is NOT a US equities trading day."""
+    if executor.is_trading_day_today():
+        return False
+    logger.info(f"⏭  {job_name}: market closed today — skipping.")
+    return True
 
 
 # ── Scheduled Jobs ────────────────────────────────────────────────────────────
@@ -45,6 +61,11 @@ def post_close_scan():
     16:30 ET — Scan all symbols and build the pending action queue.
     Checks for: new entry signals, RSI exit signals, time stop triggers.
     """
+    # Skip on weekends/holidays. Bars wouldn't have changed since the last
+    # session anyway, and we'd just be hammering the data API for no reason.
+    if _skip_if_closed("POST-CLOSE SCAN"):
+        return
+
     global _pending
     _pending.clear()
 
@@ -87,6 +108,12 @@ def pre_open_execute():
     09:25 ET — Execute all queued actions before the market opens.
     Market OPG orders fill at the official opening auction price.
     """
+    # Skip on non-trading days. Without this guard, OPG orders submitted on
+    # a Saturday or holiday morning would be rejected (or worse, queued and
+    # filled at an unintended next-session open).
+    if _skip_if_closed("PRE-OPEN EXECUTE"):
+        return
+
     global _pending
 
     if not _pending:
@@ -117,6 +144,11 @@ def fill_confirm():
     09:45 ET — Confirm fills and place hard stop orders on the exchange.
     Runs 15 minutes after open to ensure OPG orders have been processed.
     """
+    # Skip on non-trading days. There won't be any fills to confirm on a
+    # day the market never opened, and the GTC stop placement would fail.
+    if _skip_if_closed("FILL CONFIRM"):
+        return
+
     logger.info("▶  FILL CONFIRMATION + STOP PLACEMENT")
     executor.confirm_fills_and_place_stops()
 
@@ -126,6 +158,10 @@ def status_report():
     Log a snapshot of open positions and their current age.
     Runs daily at 16:30 alongside the scan (injected separately for clarity).
     """
+    # Same guard as the scan — no point printing a stale report on closed days.
+    if _skip_if_closed("STATUS"):
+        return
+
     positions = pt.all_positions()
     if not positions:
         logger.info("STATUS | No open positions.")

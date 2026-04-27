@@ -11,10 +11,11 @@ The hard stop sits on Alpaca's servers — it executes even if this bot crashes.
 """
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
+    GetCalendarRequest,
     GetOrdersRequest,
     MarketOrderRequest,
     StopOrderRequest,
@@ -35,6 +36,23 @@ _client = TradingClient(config.API_KEY, config.SECRET_KEY, paper=config.PAPER)
 def get_equity() -> float:
     account = _client.get_account()
     return float(account.equity)
+
+
+# ── Market Calendar ───────────────────────────────────────────────────────────
+# Alpaca's calendar API is the single source of truth for which days the US
+# equities market is open. It already accounts for weekends, federal holidays,
+# and early-close days (e.g. day after Thanksgiving). We use it to skip the
+# scheduled jobs on non-trading days instead of trying to maintain our own
+# holiday table.
+
+def is_trading_day_today() -> bool:
+    """Return True if today has (or had) a regular US equities trading session."""
+    today = date.today()
+    # Calendar request for a one-day window — empty list means no session.
+    sessions = _client.get_calendar(
+        GetCalendarRequest(start=today, end=today)
+    )
+    return len(sessions) > 0
 
 
 # ── Position Checks ───────────────────────────────────────────────────────────
