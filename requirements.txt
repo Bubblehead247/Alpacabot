@@ -3,3 +3,5 @@ ta
 pandas
 schedule
 streamlit
+psutil
+streamlit-autorefresh
