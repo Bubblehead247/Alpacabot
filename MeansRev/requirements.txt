@@ -4,3 +4,4 @@ numpy>=1.24.0
 schedule>=1.2.0
 yfinance>=0.2.40
 python-dotenv>=1.0.0
+streamlit>=1.30.0
