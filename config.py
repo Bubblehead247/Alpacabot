@@ -7,8 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load credentials from ../alpaca.env (parent folder) if present
-load_dotenv(Path(__file__).resolve().parent.parent / "alpaca.env")
+# Load credentials from alpaca.env in the same directory as this file
+load_dotenv(Path(__file__).resolve().parent / "alpaca.env")
 
 # ── Alpaca Credentials ────────────────────────────────────────────────────────
 API_KEY    = os.getenv("ALPACA_API_KEY", "YOUR_KEY_HERE")
