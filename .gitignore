@@ -1,0 +1,11 @@
+alpaca.env
+.env
+API.txt
+*.log
+__pycache__/
+*.pyc
+*.zip
+backtest_trades.csv
+backtest_summary.csv
+positions.json
+.claude/
