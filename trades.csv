@@ -1,0 +1,5 @@
+symbol,entry_date,entry_price,shares,stop_price,stop_mult,rsi2_at_signal,sma200_weekly_at_signal,sma50_daily_at_signal,atr14_at_signal,exit_date,exit_price,exit_reason,days_held,realized_pnl,realized_pnl_pct
+KRE,2026-05-12,67.48,599,65.21,2.5,,,,,2026-05-20,67.86,backfill,8,227.62,0.563
+XLRE,2026-05-15,43.37,1453,42.53,2.5,,,,,2026-05-29,44.24,backfill,14,1264.11,2.006
+IWM,2026-05-19,271.8956,169,264.1,2.5,,,,,2026-05-28,289.5,backfill_rsi_exit,9,2975.15,6.475
+GDX,2026-05-19,84.25,212,77.62,2.5,,,,,2026-05-29,87.06,backfill_time_stop,10,595.72,3.335
