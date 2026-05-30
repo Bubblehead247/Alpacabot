@@ -6,8 +6,6 @@ Alpaca tracks shares, cost basis, and P&L. We track what Alpaca doesn't:
   - Which stop multiplier variant was used
   - The stop order ID (so we can cancel it before placing a market exit)
   - Both stop price variants (for performance comparison logging)
-
-Data is written to positions.json in the working directory.
 """
 import json
 import logging
@@ -46,28 +44,28 @@ def add(
     stop_mult: float,
     stop_order_id: str = None,
     rsi2: float = None,
-    sma200: float = None,
-    ema50: float = None,
+    sma200_weekly: float = None,
+    sma50_daily: float = None,
     atr14: float = None,
 ):
     """Record a new open position."""
     data = _load()
     data[symbol] = {
-        "symbol":           symbol,
-        "entry_price":      entry_price,
-        "stop_price":       stop_price,     # Active stop (the one on exchange)
-        "stop_price_a":     stop_price_a,   # 1.5×ATR — tracked for comparison
-        "stop_price_b":     stop_price_b,   # 2.5×ATR — tracked for comparison
-        "shares":           shares,
-        "stop_mult":        stop_mult,
-        "stop_order_id":    stop_order_id,
-        "exit_status":      "open",         # "open" | "exit_pending"
-        "rsi2_at_signal":   rsi2,
-        "sma200_at_signal": sma200,
-        "ema50_at_signal":  ema50,
-        "atr14_at_signal":  atr14,
-        "entry_date":       date.today().isoformat(),
-        "opened_at":        datetime.utcnow().isoformat(),
+        "symbol":                  symbol,
+        "entry_price":             entry_price,
+        "stop_price":              stop_price,      # Active stop (the one on exchange)
+        "stop_price_a":            stop_price_a,    # 1.5×ATR — tracked for comparison
+        "stop_price_b":            stop_price_b,    # 2.5×ATR — tracked for comparison
+        "shares":                  shares,
+        "stop_mult":               stop_mult,
+        "stop_order_id":           stop_order_id,
+        "exit_status":             "open",          # "open" | "exit_pending"
+        "rsi2_at_signal":          rsi2,
+        "sma200_weekly_at_signal": sma200_weekly,
+        "sma50_daily_at_signal":   sma50_daily,
+        "atr14_at_signal":         atr14,
+        "entry_date":              date.today().isoformat(),
+        "opened_at":               datetime.utcnow().isoformat(),
     }
     _save(data)
     logger.info(

@@ -16,7 +16,7 @@ CSV_FILE = Path("trades.csv")
 HEADERS = [
     "symbol", "entry_date", "entry_price", "shares",
     "stop_price", "stop_mult",
-    "rsi2_at_signal", "sma200_at_signal", "ema50_at_signal", "atr14_at_signal",
+    "rsi2_at_signal", "sma200_weekly_at_signal", "sma50_daily_at_signal", "atr14_at_signal",
     "exit_date", "exit_price", "exit_reason",
     "days_held", "realized_pnl", "realized_pnl_pct",
 ]
@@ -27,10 +27,10 @@ def log_closed_trade(pos_data: dict, exit_price: float, exit_reason: str):
     Append a closed-trade row to trades.csv.
 
     Args:
-        pos_data:    Position dict from position_tracker (must have entry_price,
-                     shares, entry_date, and optional signal indicator fields).
+        pos_data:    Position dict from position_tracker.
         exit_price:  Actual fill price of the closing order.
-        exit_reason: One of: rsi_exit, time_stop, hard_stop, exit_pending_retry.
+        exit_reason: One of: rsi_exit, weekly_trend_break, time_stop, hard_stop,
+                     exit_pending_retry, or *_fallback variants.
     """
     entry_price = pos_data["entry_price"]
     shares      = pos_data["shares"]
@@ -41,22 +41,22 @@ def log_closed_trade(pos_data: dict, exit_price: float, exit_reason: str):
     pnl_pct = round((exit_price / entry_price - 1) * 100, 3) if entry_price else 0.0
 
     row = {
-        "symbol":           pos_data["symbol"],
-        "entry_date":       entry_date.isoformat(),
-        "entry_price":      round(entry_price, 4),
-        "shares":           shares,
-        "stop_price":       pos_data.get("stop_price", ""),
-        "stop_mult":        pos_data.get("stop_mult", ""),
-        "rsi2_at_signal":   pos_data.get("rsi2_at_signal", ""),
-        "sma200_at_signal": pos_data.get("sma200_at_signal", ""),
-        "ema50_at_signal":  pos_data.get("ema50_at_signal", ""),
-        "atr14_at_signal":  pos_data.get("atr14_at_signal", ""),
-        "exit_date":        exit_date.isoformat(),
-        "exit_price":       round(exit_price, 4),
-        "exit_reason":      exit_reason,
-        "days_held":        (exit_date - entry_date).days,
-        "realized_pnl":     pnl,
-        "realized_pnl_pct": pnl_pct,
+        "symbol":                  pos_data["symbol"],
+        "entry_date":              entry_date.isoformat(),
+        "entry_price":             round(entry_price, 4),
+        "shares":                  shares,
+        "stop_price":              pos_data.get("stop_price", ""),
+        "stop_mult":               pos_data.get("stop_mult", ""),
+        "rsi2_at_signal":          pos_data.get("rsi2_at_signal", ""),
+        "sma200_weekly_at_signal": pos_data.get("sma200_weekly_at_signal", ""),
+        "sma50_daily_at_signal":   pos_data.get("sma50_daily_at_signal", ""),
+        "atr14_at_signal":         pos_data.get("atr14_at_signal", ""),
+        "exit_date":               exit_date.isoformat(),
+        "exit_price":              round(exit_price, 4),
+        "exit_reason":             exit_reason,
+        "days_held":               (exit_date - entry_date).days,
+        "realized_pnl":            pnl,
+        "realized_pnl_pct":        pnl_pct,
     }
 
     write_header = not CSV_FILE.exists()

@@ -3,8 +3,8 @@ main.py — Scheduler and main loop for the Mean Reversion Bot.
 
 Daily schedule (all times Eastern):
   16:30 → Post-close scan:  evaluate entry/exit signals, queue actions
-  09:25 → Pre-open execute: submit queued market orders for next open
-  09:45 → Fill confirm:     verify fills, place hard stop orders on exchange
+  09:25 → Pre-open execute: submit LOO limit orders (market fallback if unfilled by 9:45)
+  09:45 → Fill confirm:     verify fills, place GTC hard stops, resolve exit orders
 
 Run with:  python main.py
 Logs to:   bot.log  (and stdout)
@@ -37,16 +37,11 @@ logger = logging.getLogger(__name__)
 
 # ── Pending Signal Queue ──────────────────────────────────────────────────────
 # Populated by post_close_scan(), consumed by pre_open_execute().
-# Each scan starts by clearing this list, so a weekend or holiday scan can't
-# leave stale signals around to fire on the next trading day's open.
+# Cleared at the start of each scan so stale signals never carry over.
 _pending: list[dict] = []
 
 
 # ── Market-Day Guard ──────────────────────────────────────────────────────────
-# `schedule.every().day.at(...)` fires every calendar day, including Saturdays,
-# Sundays, and US market holidays. Wrapping each job with this guard makes every
-# job a no-op on non-trading days, so we don't waste API calls scanning stale
-# data or submit orders that the exchange will reject.
 
 def _skip_if_closed(job_name: str) -> bool:
     """Returns True (and logs) if today is NOT a US equities trading day."""
@@ -61,10 +56,13 @@ def _skip_if_closed(job_name: str) -> bool:
 def post_close_scan():
     """
     16:30 ET — Scan all symbols and build the pending action queue.
-    Checks for: new entry signals, RSI exit signals, time stop triggers.
+
+    Exit priority (first match wins per symbol):
+      1. Hard stop    — detected from Alpaca position disappearing (handled here)
+      2. Time stop    — position age >= MAX_HOLD_DAYS
+      3. Weekly break — close below weekly SMA(200)
+      4. RSI exit     — RSI(2) crosses back below 70
     """
-    # Skip on weekends/holidays. Bars wouldn't have changed since the last
-    # session anyway, and we'd just be hammering the data API for no reason.
     if _skip_if_closed("POST-CLOSE SCAN"):
         return
 
@@ -73,11 +71,11 @@ def post_close_scan():
 
     logger.info("▶  POST-CLOSE SCAN STARTED")
 
-    scan_results = scanner.run_scan()
-    open_positions = executor.get_alpaca_positions()
+    scan_results     = scanner.run_scan()
+    open_positions   = executor.get_alpaca_positions()
 
-    # Detect hard stop exits: positions tracked as "open" that are no longer
-    # in Alpaca must have been closed by the GTC stop order during the session.
+    # Detect hard stop exits: positions tracked as "open" that vanished from Alpaca
+    # must have been closed by the GTC stop during the session.
     for symbol, pos_data in list(pt.all_positions().items()):
         if pos_data.get("exit_status") == "open" and symbol not in open_positions:
             exit_price = executor.get_last_fill_price(symbol, side="sell")
@@ -95,19 +93,25 @@ def post_close_scan():
 
         in_position = symbol in open_positions
 
-        # ── Time Stop Check ──
+        # ── Time Stop (highest soft-exit priority) ──
         if in_position and pt.time_stop_triggered(symbol):
             _pending.append({"symbol": symbol, "action": "EXIT", "reason": "time_stop", "close": result["close"]})
             logger.info(f"  ⏰ Queued EXIT (time_stop): {symbol}")
-            continue  # Don't also queue an RSI exit for the same symbol
+            continue
 
-        # ── RSI Exit Check ──
+        # ── Weekly Trend Break (High priority exit) ──
+        if in_position and result.get("weekly_exit_signal"):
+            _pending.append({"symbol": symbol, "action": "EXIT", "reason": "weekly_trend_break", "close": result["close"]})
+            logger.info(f"  📤 Queued EXIT (weekly_trend_break): {symbol}")
+            continue
+
+        # ── RSI Exit (Standard priority) ──
         if in_position and result["exit_signal"]:
             _pending.append({"symbol": symbol, "action": "EXIT", "reason": "rsi_exit", "close": result["close"]})
             logger.info(f"  📤 Queued EXIT (rsi_exit): {symbol}")
             continue
 
-        # ── Entry Check ──
+        # ── Entry ──
         if not in_position and result["entry_signal"]:
             queued_entries = sum(1 for p in _pending if p["action"] == "ENTRY")
             if len(open_positions) + queued_entries >= config.MAX_POSITIONS:
@@ -123,9 +127,7 @@ def post_close_scan():
             logger.info(f"  ⚠️  Warning zone: {symbol} RSI(2)={result['rsi2']:.1f}")
             notifier.send_warning(symbol, result["rsi2"])
 
-    # Re-queue exits for positions marked exit_pending from a prior cycle.
-    # Catches symbols where the LOO sell expired and the fallback also failed,
-    # or where confirm_exit_fills hasn't run yet since the exit was signalled.
+    # Re-queue exits for positions marked exit_pending from a prior cycle
     for symbol in pt.get_exit_pending_symbols():
         if symbol in open_positions:
             already_queued = any(p["symbol"] == symbol and p["action"] == "EXIT" for p in _pending)
@@ -147,12 +149,9 @@ def post_close_scan():
 
 def pre_open_execute():
     """
-    09:25 ET — Execute all queued actions before the market opens.
-    Market OPG orders fill at the official opening auction price.
+    09:25 ET — Submit LOO limit orders for all queued actions.
+    Unfilled limits are caught at 09:45 and replaced with market orders.
     """
-    # Skip on non-trading days. Without this guard, OPG orders submitted on
-    # a Saturday or holiday morning would be rejected (or worse, queued and
-    # filled at an unintended next-session open).
     if _skip_if_closed("PRE-OPEN EXECUTE"):
         return
 
@@ -170,10 +169,8 @@ def pre_open_execute():
 
         if kind == "EXIT":
             executor.submit_exit(symbol, reason=action.get("reason", "signal"), close_price=action.get("close", 0.0))
-
         elif kind == "ENTRY":
             executor.submit_entry(action["scan_result"])
-
         else:
             logger.warning(f"Unknown action type '{kind}' for {symbol} — skipping.")
 
@@ -183,11 +180,9 @@ def pre_open_execute():
 
 def fill_confirm():
     """
-    09:45 ET — Confirm fills and place hard stop orders on the exchange.
-    Runs 15 minutes after open to ensure OPG orders have been processed.
+    09:45 ET — Confirm fills, place hard stops, and resolve pending exits.
+    LOO orders unfilled by this point get replaced with DAY market orders.
     """
-    # Skip on non-trading days. There won't be any fills to confirm on a
-    # day the market never opened, and the GTC stop placement would fail.
     if _skip_if_closed("FILL CONFIRM"):
         return
 
@@ -197,11 +192,7 @@ def fill_confirm():
 
 
 def status_report():
-    """
-    Log a snapshot of open positions and their current age.
-    Runs daily at 16:30 alongside the scan (injected separately for clarity).
-    """
-    # Same guard as the scan — no point printing a stale report on closed days.
+    """Log a snapshot of open positions and their current age."""
     if _skip_if_closed("STATUS"):
         return
 
@@ -228,20 +219,22 @@ def main():
     logger.info("=" * 70)
     logger.info("MEAN REVERSION BOT — STARTING UP")
     logger.info(f"  Universe:         {config.SYMBOLS}")
-    logger.info(f"  RSI(2) entry:     <= {config.RSI_ENTRY_THRESHOLD}")
-    logger.info(f"  RSI(2) exit:      cross below {config.RSI_EXIT_THRESHOLD} (prev bar >= {config.RSI_EXIT_THRESHOLD})")
-    logger.info(f"  Trend filter:     Close > SMA({config.SMA_PERIOD}) AND Close > EMA({config.EMA_PERIOD})")
+    logger.info(f"  Weekly gate:      Close > SMA({config.SMA_WEEKLY_FAST},W) AND SMA({config.SMA_WEEKLY_SLOW},W)")
+    logger.info(f"  Daily trend:      Close > SMA({config.SMA_DAILY},D)")
+    logger.info(f"  RSI(2) entry:     crosses ABOVE {config.RSI_ENTRY_THRESHOLD} (prev <= {config.RSI_ENTRY_THRESHOLD})")
+    logger.info(f"  RSI(2) exit:      crosses below {config.RSI_EXIT_THRESHOLD} (prev >= {config.RSI_EXIT_THRESHOLD})")
+    logger.info(f"  Volume filter:    volume > {config.VOLUME_SPIKE_MULT}× MA({config.VOLUME_MA_PERIOD})")
     logger.info(f"  Active stop:      {config.ACTIVE_STOP_MULT}× ATR({config.ATR_PERIOD})")
     logger.info(f"  Tracking stop A:  {config.STOP_MULT_A}× ATR (logged, not traded)")
     logger.info(f"  Tracking stop B:  {config.STOP_MULT_B}× ATR (logged, not traded)")
     logger.info(f"  Risk per trade:   {config.RISK_PER_TRADE * 100:.1f}% of equity")
     logger.info(f"  Max positions:    {config.MAX_POSITIONS} ({config.MAX_POSITIONS * config.RISK_PER_TRADE * 100:.0f}% max total risk)")
     logger.info(f"  Time stop:        {config.MAX_HOLD_DAYS} days")
+    logger.info(f"  Orders:           LOO limit first; market fallback at {config.FILL_CONFIRM_TIME}")
     logger.info(f"  Paper trading:    {config.PAPER}")
     logger.info(f"  Schedule:         Scan@{config.SCAN_TIME} | Execute@{config.EXECUTE_TIME} | Confirm@{config.FILL_CONFIRM_TIME}")
     logger.info("=" * 70)
 
-    # Wire up the schedule (server must be in US/Eastern time zone)
     schedule.every().day.at(config.SCAN_TIME).do(post_close_scan)
     schedule.every().day.at(config.SCAN_TIME).do(status_report)
     schedule.every().day.at(config.EXECUTE_TIME).do(pre_open_execute)

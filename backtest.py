@@ -84,6 +84,7 @@ class BacktestResult:
     rsi_exits:       int   = 0
     stop_exits:      int   = 0
     time_exits:      int   = 0
+    weekly_exits:    int   = 0
     trades:          list  = field(default_factory=list)
 
 
@@ -135,6 +136,25 @@ def fetch_history(symbol: str, start: datetime, end: datetime, source: str = "yf
     return fetch_history_yfinance(symbol, start, end)
 
 
+# ── Weekly Trend Gate ─────────────────────────────────────────────────────────
+
+def weekly_smas_daily(bars: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """
+    Compute weekly SMA(50) and SMA(200) and forward-fill them onto the daily index.
+
+    Mirrors scanner.py's weekly gate: weekly bars are resampled from daily closes
+    (W-FRI), the SMAs are computed on the weekly series, then aligned back to each
+    daily bar using the most recently completed week (ffill — no lookahead, since a
+    given trading day only ever sees weekly values labelled on/before its own date).
+    """
+    weekly_close = bars["close"].resample("W-FRI").last().dropna()
+    w50  = sma(weekly_close, config.SMA_WEEKLY_FAST)
+    w200 = sma(weekly_close, config.SMA_WEEKLY_SLOW)
+    w50_daily  = w50.reindex(bars.index, method="ffill")
+    w200_daily = w200.reindex(bars.index, method="ffill")
+    return w50_daily, w200_daily
+
+
 # ── Core Backtest Engine ──────────────────────────────────────────────────────
 
 def backtest_symbol(
@@ -144,13 +164,20 @@ def backtest_symbol(
     initial_equity: float = 100_000.0,
 ) -> BacktestResult:
     """
-    Simulate the strategy on a single symbol with a given stop multiplier.
+    Simulate the LIVE strategy (matches scanner.py) on one symbol + stop multiplier.
 
-    Rules simulated:
-      Entry:    Close > SMA(200) AND RSI(2) <= 10 → buy next open (approximated as next close)
-      Exit 1:   RSI(2) >= 70 at close → sell next open
-      Exit 2:   Intraday low touches stop price → stopped out at stop price (worst case)
-      Exit 3:   Position held >= MAX_HOLD_DAYS → sell at close
+    Entry (ALL must pass, signal at close → buy next open):
+      Weekly gate:  Close > weekly SMA(50) AND Close > weekly SMA(200)
+      Daily trend:  Close > daily SMA(50)
+      RSI signal:   RSI(2) crossed back ABOVE 10 (prev <= 10, now > 10)
+      Volume:       Optional — Volume > VOLUME_SPIKE_MULT × 20-day average
+                    (only enforced when config.USE_VOLUME_FILTER is True)
+
+    Exit (first match wins):
+      Hard stop:    intraday low <= stop price → fill at stop (conservative) [Highest]
+      Time stop:    held >= MAX_HOLD_DAYS → exit next open
+      Weekly break: Close < weekly SMA(200) → exit next open                 [High]
+      RSI target:   RSI(2) crossed back BELOW 70 (prev >= 70, now < 70)      [Standard]
     """
     variant_label = f"{stop_mult}x"
     logger.info(f"Backtesting {symbol} | Stop: {stop_mult}×ATR | Bars: {len(bars)}")
@@ -159,14 +186,23 @@ def backtest_symbol(
     high   = bars["high"]
     low    = bars["low"]
     opens  = bars["open"]
+    volume = bars["volume"]
     dates  = bars.index
 
-    sma200 = sma(close, config.SMA_PERIOD)
-    rsi2   = rsi(close, config.RSI_PERIOD)
-    atr14  = atr(high, low, close, config.ATR_PERIOD)
+    sma50_d  = sma(close, config.SMA_DAILY)
+    rsi2     = rsi(close, config.RSI_PERIOD)
+    atr14    = atr(high, low, close, config.ATR_PERIOD)
+    vol_ma   = sma(volume, config.VOLUME_MA_PERIOD)
+    w50_d, w200_d = weekly_smas_daily(bars)
+
+    # Warmup: need enough bars for daily SMA50, ATR, volume MA, and a valid weekly SMA200.
+    warmup = max(config.SMA_DAILY, config.ATR_PERIOD, config.VOLUME_MA_PERIOD) + 5
+    start_i = warmup
+    # Advance start until the weekly SMA200 series has warmed up too.
+    while start_i < len(bars) and pd.isna(w200_d.iloc[start_i]):
+        start_i += 1
 
     equity        = initial_equity
-    equity_curve  = []
     trades        = []
     in_position   = False
     entry_price   = 0.0
@@ -177,15 +213,15 @@ def backtest_symbol(
     peak_equity   = initial_equity
     max_drawdown  = 0.0
 
-    for i in range(config.SMA_PERIOD + 5, len(bars)):
+    for i in range(start_i, len(bars)):
         date_str   = str(dates[i].date())
         day_open   = float(opens.iloc[i])
         day_close  = float(close.iloc[i])
         day_low    = float(low.iloc[i])
-        day_high   = float(high.iloc[i])
         cur_rsi    = float(rsi2.iloc[i])
-        cur_sma    = float(sma200.iloc[i])
+        prev_rsi   = float(rsi2.iloc[i - 1])
         cur_atr    = float(atr14.iloc[i])
+        cur_w200   = float(w200_d.iloc[i]) if not pd.isna(w200_d.iloc[i]) else None
 
         # ── Check Exits First (if in position) ──────────────────────────────
         if in_position:
@@ -203,8 +239,14 @@ def backtest_symbol(
                 exit_price  = day_open     # Exit at open on day 7
                 exit_reason = "time_stop"
 
-            # Priority 3: RSI exit (signal from prior close, exit at today's open)
-            elif float(rsi2.iloc[i - 1]) >= config.RSI_EXIT_THRESHOLD:
+            # Priority 3: Weekly trend break — prior close below weekly SMA(200)
+            elif cur_w200 is not None and float(close.iloc[i - 1]) < float(w200_d.iloc[i - 1]):
+                exit_price  = day_open
+                exit_reason = "weekly_exit"
+
+            # Priority 4: RSI exit — RSI(2) crossed back below 70 at prior close
+            elif (float(rsi2.iloc[i - 2]) >= config.RSI_EXIT_THRESHOLD
+                  and prev_rsi < config.RSI_EXIT_THRESHOLD):
                 exit_price  = day_open
                 exit_reason = "rsi_exit"
 
@@ -232,10 +274,17 @@ def backtest_symbol(
 
         # ── Check Entry (only if flat) ───────────────────────────────────────
         if not in_position:
-            above_sma = day_close > cur_sma
-            oversold  = cur_rsi   <= config.RSI_ENTRY_THRESHOLD
+            w50  = float(w50_d.iloc[i])  if not pd.isna(w50_d.iloc[i])  else None
+            weekly_ok = (cur_w200 is not None and w50 is not None
+                         and day_close > w50 and day_close > cur_w200)
+            above_daily_sma = day_close > float(sma50_d.iloc[i]) if not pd.isna(sma50_d.iloc[i]) else False
+            rsi_cross_above = (prev_rsi <= config.RSI_ENTRY_THRESHOLD) and (cur_rsi > config.RSI_ENTRY_THRESHOLD)
+            vol_spike = (not pd.isna(vol_ma.iloc[i])
+                         and float(volume.iloc[i]) > config.VOLUME_SPIKE_MULT * float(vol_ma.iloc[i]))
+            vol_ok = vol_spike if config.USE_VOLUME_FILTER else True
 
-            if above_sma and oversold and not pd.isna(cur_atr):
+            if (weekly_ok and above_daily_sma and rsi_cross_above and vol_ok
+                    and not pd.isna(cur_atr)):
                 # Enter at next bar's open — use next day's open if available
                 if i + 1 < len(bars):
                     entry_price  = float(opens.iloc[i + 1])
@@ -260,12 +309,9 @@ def backtest_symbol(
                 in_position  = True
 
         # ── Track Equity Curve + Drawdown ────────────────────────────────────
-        # Mark-to-market if in position
         current_value = equity
         if in_position:
             current_value = equity + ((day_close - entry_price) * shares)
-
-        equity_curve.append(current_value)
 
         if current_value > peak_equity:
             peak_equity = current_value
@@ -288,17 +334,17 @@ def backtest_symbol(
 
     total_return = (equity - initial_equity) / initial_equity * 100
 
-    # CAGR — annualized from actual number of trading days
-    n_bars  = len(bars) - config.SMA_PERIOD - 5
+    # CAGR — annualized from actual number of trading days simulated
+    n_bars  = len(bars) - start_i
     n_years = n_bars / 252
-    cagr    = ((equity / initial_equity) ** (1 / n_years) - 1) * 100 if n_years > 0 else 0
+    cagr    = ((equity / initial_equity) ** (1 / n_years) - 1) * 100 if n_years > 0 and equity > 0 else 0
 
     avg_hold = sum(t.hold_days for t in trades) / len(trades) if trades else 0
 
     return BacktestResult(
         symbol=symbol,
         stop_variant=variant_label,
-        start_date=str(bars.index[config.SMA_PERIOD + 5].date()),
+        start_date=str(bars.index[start_i].date()) if start_i < len(bars) else str(bars.index[-1].date()),
         end_date=str(bars.index[-1].date()),
         initial_equity=initial_equity,
         final_equity=round(equity, 2),
@@ -316,6 +362,7 @@ def backtest_symbol(
         rsi_exits=sum(1 for t in trades if t.exit_reason == "rsi_exit"),
         stop_exits=sum(1 for t in trades if t.exit_reason == "stop_loss"),
         time_exits=sum(1 for t in trades if t.exit_reason == "time_stop"),
+        weekly_exits=sum(1 for t in trades if t.exit_reason == "weekly_exit"),
         trades=trades,
     )
 
@@ -335,7 +382,7 @@ def print_result(r: BacktestResult):
     print(f"  Profit Factor:{r.profit_factor:.2f}")
     print(f"  Avg Hold:     {r.avg_hold_days:.1f} days")
     print(f"{'─' * 60}")
-    print(f"  Exit Reasons: RSI={r.rsi_exits}  Stop={r.stop_exits}  Time={r.time_exits}")
+    print(f"  Exit Reasons: RSI={r.rsi_exits}  Stop={r.stop_exits}  Time={r.time_exits}  Weekly={r.weekly_exits}")
     print(f"{'=' * 60}\n")
 
 
@@ -370,6 +417,7 @@ def save_summary_csv(results: list[BacktestResult], filename: str = "backtest_su
             "rsi_exits":       r.rsi_exits,
             "stop_exits":      r.stop_exits,
             "time_exits":      r.time_exits,
+            "weekly_exits":    r.weekly_exits,
             "final_equity":    r.final_equity,
         })
     with open(filename, "w", newline="") as f:
@@ -383,7 +431,7 @@ def save_summary_csv(results: list[BacktestResult], filename: str = "backtest_su
 
 def run_backtest(
     symbols: list[str] = None,
-    years: int = 5,
+    years: int = 12,
     start_date: str = None,
     initial_equity: float = 100_000.0,
     source: str = "yfinance",
@@ -409,8 +457,12 @@ def run_backtest(
             logger.error(f"Failed to fetch {symbol}: {e}")
             continue
 
-        if len(bars) < config.SMA_PERIOD + 20:
-            logger.warning(f"{symbol}: Not enough historical data ({len(bars)} bars). Skipping.")
+        # Weekly SMA(200) needs ~200 weeks (~1000 trading days) just to warm up.
+        if len(bars) < 1050:
+            logger.warning(
+                f"{symbol}: Not enough history ({len(bars)} bars) for the weekly "
+                f"SMA(200) gate — needs ~1050. Skipping."
+            )
             continue
 
         for stop_mult in [config.STOP_MULT_A, config.STOP_MULT_B]:
@@ -433,7 +485,7 @@ def run_backtest(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Mean Reversion Strategy Backtester")
     parser.add_argument("--symbols", nargs="+", default=None,     help="Symbols to test (default: config.SYMBOLS)")
-    parser.add_argument("--years",   type=int,   default=5,        help="Years of history (default: 5)")
+    parser.add_argument("--years",   type=int,   default=12,       help="Years of history (default: 12 — weekly SMA200 needs ~4yr warmup)")
     parser.add_argument("--start",   type=str,   default=None,     help="Start date YYYY-MM-DD (overrides --years)")
     parser.add_argument("--equity",  type=float, default=100_000,  help="Starting equity (default: 100000)")
     parser.add_argument("--source",  choices=["yfinance", "alpaca"], default="yfinance", help="Data source (default: yfinance)")

@@ -1,8 +1,18 @@
 """
-scanner.py — Fetches daily OHLCV bars from Alpaca and evaluates entry/exit conditions.
+scanner.py — Fetches daily and weekly OHLCV bars and evaluates entry/exit signals.
 
-Entry signal:   Close > SMA(200)  AND  RSI(2) <= 10
-Exit signal:    RSI(2) >= 70  OR  position age >= 7 days (time stop handled in main.py)
+Entry (ALL must pass):
+  Weekly gate:   Close > SMA(50,W)  AND  Close > SMA(200,W)
+  Daily trend:   Close > SMA(50,D)
+  RSI signal:    RSI(2) crossed back ABOVE 10 today (prev <= 10, now > 10)
+  Volume:        Optional — today's volume > 1.5× the 20-day average
+                 (only enforced when config.USE_VOLUME_FILTER is True)
+
+Exit (first triggered wins, checked in this priority order):
+  Weekly break:  Close < SMA(200,W)  — structural trend broken        [High]
+  RSI target:    RSI(2) crossed back BELOW 70 (prev >= 70, now < 70)  [Standard]
+  Time stop:     Position held >= 7 calendar days                     [Standard] (checked in main.py)
+  Hard stop:     ATR-based GTC order on exchange                      [Highest]  (handled by Alpaca)
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -14,7 +24,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 import config
-from indicators import sma, ema, rsi, atr
+from indicators import sma, rsi, atr
 
 logger = logging.getLogger(__name__)
 
@@ -23,118 +33,169 @@ _data_client = StockHistoricalDataClient(config.API_KEY, config.SECRET_KEY)
 
 # ── Data Fetching ─────────────────────────────────────────────────────────────
 
-def fetch_bars(symbol: str, lookback_days: int = config.LOOKBACK_DAYS) -> pd.DataFrame:
-    """
-    Fetch daily OHLCV bars from Alpaca.
-    Requests 1.6× the lookback to account for weekends and market holidays.
-    """
+def _fetch_bars(symbol: str, timeframe: TimeFrame, calendar_days_back: int) -> pd.DataFrame:
     end   = datetime.now(timezone.utc)
-    start = end - timedelta(days=int(lookback_days * 1.6))
-
-    # feed=IEX is required on the free Alpaca data plan — the default SIP feed
-    # returns 401/"subscription does not permit recent SIP data". IEX is a single
-    # exchange but its bars are sufficient for daily-bar mean-reversion signals.
+    start = end - timedelta(days=calendar_days_back)
     request = StockBarsRequest(
         symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Day,
+        timeframe=timeframe,
         start=start,
         end=end,
         feed=DataFeed.IEX,
     )
-
     bars = _data_client.get_stock_bars(request).df
-
-    # Alpaca returns MultiIndex (symbol, timestamp) for single-symbol requests too
     if isinstance(bars.index, pd.MultiIndex):
         bars = bars.xs(symbol, level="symbol")
+    return bars.sort_index()
 
-    return bars.sort_index().tail(lookback_days)
+
+def fetch_bars(symbol: str) -> pd.DataFrame:
+    """Daily OHLCV — enough for SMA(50), ATR(14), and volume MA(20)."""
+    return _fetch_bars(
+        symbol, TimeFrame.Day, int(config.LOOKBACK_DAYS * 1.6)
+    ).tail(config.LOOKBACK_DAYS)
+
+
+def fetch_weekly_bars(symbol: str) -> pd.DataFrame:
+    """Weekly OHLCV — enough for SMA(50,W) and SMA(200,W)."""
+    calendar_days = int(config.WEEKLY_LOOKBACK_WEEKS * 7 * 1.3)
+    return _fetch_bars(
+        symbol, TimeFrame.Week, calendar_days
+    ).tail(config.WEEKLY_LOOKBACK_WEEKS)
 
 
 # ── Signal Evaluation ─────────────────────────────────────────────────────────
 
 def evaluate_symbol(symbol: str) -> dict:
     """
-    Evaluate a single symbol for entry and exit conditions.
+    Evaluate entry and exit conditions for a symbol.
 
     Returns a dict with keys:
-        symbol, close, sma200, rsi2, atr14,
+        symbol, close,
+        sma50_daily, sma50_weekly, sma200_weekly,
+        rsi2, prev_rsi2, atr14, volume, volume_ma20,
         stop_a, stop_b, active_stop,
-        entry_signal (bool), exit_signal (bool)
+        entry_signal (bool), exit_signal (bool), weekly_exit_signal (bool)
     """
+    # ── Daily bars ────────────────────────────────────────────────────────────
     bars = fetch_bars(symbol)
 
-    if len(bars) < config.SMA_PERIOD + 10:
-        logger.warning(f"{symbol}: Insufficient data ({len(bars)} bars). Need {config.SMA_PERIOD + 10}.")
-        return {"symbol": symbol, "entry_signal": False, "exit_signal": False, "error": "insufficient_data"}
+    if len(bars) < 60:
+        logger.warning(f"{symbol}: Insufficient daily data ({len(bars)} bars). Skipping.")
+        return {
+            "symbol": symbol, "entry_signal": False,
+            "exit_signal": False, "weekly_exit_signal": False,
+            "error": "insufficient_data",
+        }
 
-    close = bars["close"]
-    high  = bars["high"]
-    low   = bars["low"]
+    close  = bars["close"]
+    high   = bars["high"]
+    low    = bars["low"]
+    volume = bars["volume"]
 
-    sma200 = sma(close, config.SMA_PERIOD)
-    ema50  = ema(close, config.EMA_PERIOD)
-    rsi2   = rsi(close, config.RSI_PERIOD)
-    atr14  = atr(high, low, close, config.ATR_PERIOD)
+    sma50_d  = sma(close, config.SMA_DAILY)
+    rsi2     = rsi(close, config.RSI_PERIOD)
+    atr14    = atr(high, low, close, config.ATR_PERIOD)
+    vol_ma20 = sma(volume, config.VOLUME_MA_PERIOD)
 
-    last_close  = round(float(close.iloc[-1]),  2)
-    last_sma200 = round(float(sma200.iloc[-1]), 2)
-    last_ema50  = round(float(ema50.iloc[-1]),  2)
-    last_rsi2   = round(float(rsi2.iloc[-1]),   2)
-    prev_rsi2   = round(float(rsi2.iloc[-2]),   2)
-    last_atr    = round(float(atr14.iloc[-1]),  2)
+    last_close    = round(float(close.iloc[-1]),   2)
+    last_sma50_d  = round(float(sma50_d.iloc[-1]), 2)
+    last_rsi2     = round(float(rsi2.iloc[-1]),    2)
+    prev_rsi2     = round(float(rsi2.iloc[-2]),    2)
+    last_atr      = round(float(atr14.iloc[-1]),   2)
+    last_volume   = int(volume.iloc[-1])
+    last_vol_ma20 = float(vol_ma20.iloc[-1])
 
-    above_sma200 = last_close > last_sma200
-    above_ema50  = last_close > last_ema50
-    rsi_oversold = last_rsi2 <= config.RSI_ENTRY_THRESHOLD
+    above_daily_sma50 = last_close > last_sma50_d
+    # Entry: RSI(2) was <= 10 last bar, now crossed back above 10
+    rsi_crossed_above = (prev_rsi2 <= config.RSI_ENTRY_THRESHOLD) and (last_rsi2 > config.RSI_ENTRY_THRESHOLD)
+    # Exit: RSI(2) was >= 70 last bar, now crossed back below 70
+    rsi_crossed_below = (prev_rsi2 >= config.RSI_EXIT_THRESHOLD)  and (last_rsi2 < config.RSI_EXIT_THRESHOLD)
+    volume_spike      = last_volume > (config.VOLUME_SPIKE_MULT * last_vol_ma20)
 
-    # Exit when RSI(2) peaked above 70 and has now crossed back below —
-    # catches the turn rather than exiting into the peak.
-    rsi_crossed_below_exit = (prev_rsi2 >= config.RSI_EXIT_THRESHOLD) and (last_rsi2 < config.RSI_EXIT_THRESHOLD)
+    # ── Weekly bars ───────────────────────────────────────────────────────────
+    above_weekly_sma50  = False
+    above_weekly_sma200 = False
+    last_weekly_sma50   = 0.0
+    last_weekly_sma200  = 0.0
 
-    entry_signal = above_sma200 and above_ema50 and rsi_oversold
-    exit_signal  = rsi_crossed_below_exit
+    try:
+        weekly_bars = fetch_weekly_bars(symbol)
+        if len(weekly_bars) >= config.SMA_WEEKLY_SLOW + 10:
+            w_close  = weekly_bars["close"]
+            w_sma50  = sma(w_close, config.SMA_WEEKLY_FAST)
+            w_sma200 = sma(w_close, config.SMA_WEEKLY_SLOW)
+            last_weekly_sma50  = round(float(w_sma50.iloc[-1]),  2)
+            last_weekly_sma200 = round(float(w_sma200.iloc[-1]), 2)
+            above_weekly_sma50  = last_close > last_weekly_sma50
+            above_weekly_sma200 = last_close > last_weekly_sma200
+        else:
+            logger.warning(
+                f"{symbol}: Insufficient weekly data ({len(weekly_bars)} bars) "
+                f"— weekly gate FAILED (need {config.SMA_WEEKLY_SLOW + 10})."
+            )
+    except Exception as e:
+        logger.error(f"{symbol}: Weekly bar fetch failed: {e}", exc_info=True)
 
-    # Calculate both stop variants from yesterday's close (used for sizing estimate)
-    stop_a      = round(last_close - (config.STOP_MULT_A * last_atr), 2)
-    stop_b      = round(last_close - (config.STOP_MULT_B * last_atr), 2)
+    weekly_trend_ok = above_weekly_sma50 and above_weekly_sma200
+
+    # ── Stops ─────────────────────────────────────────────────────────────────
+    stop_a      = round(last_close - (config.STOP_MULT_A      * last_atr), 2)
+    stop_b      = round(last_close - (config.STOP_MULT_B      * last_atr), 2)
     active_stop = round(last_close - (config.ACTIVE_STOP_MULT * last_atr), 2)
 
+    # ── Signal logic ──────────────────────────────────────────────────────────
+    # Volume spike is an optional confirmation (see config.USE_VOLUME_FILTER).
+    volume_ok          = volume_spike if config.USE_VOLUME_FILTER else True
+    entry_signal       = weekly_trend_ok and above_daily_sma50 and rsi_crossed_above and volume_ok
+    exit_signal        = rsi_crossed_below
+    weekly_exit_signal = not above_weekly_sma200  # close below weekly SMA(200)
+
     result = {
-        "symbol":       symbol,
-        "close":        last_close,
-        "sma200":       last_sma200,
-        "ema50":        last_ema50,
-        "rsi2":         last_rsi2,
-        "prev_rsi2":    prev_rsi2,
-        "atr14":        last_atr,
-        "above_sma200": above_sma200,
-        "above_ema50":  above_ema50,
-        "stop_a":       stop_a,       # 1.5 × ATR stop
-        "stop_b":       stop_b,       # 2.5 × ATR stop
-        "active_stop":  active_stop,  # The one we actually use
-        "entry_signal": entry_signal,
-        "exit_signal":  exit_signal,
-        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "symbol":              symbol,
+        "close":               last_close,
+        "sma50_daily":         last_sma50_d,
+        "sma50_weekly":        last_weekly_sma50,
+        "sma200_weekly":       last_weekly_sma200,
+        "rsi2":                last_rsi2,
+        "prev_rsi2":           prev_rsi2,
+        "atr14":               last_atr,
+        "volume":              last_volume,
+        "volume_ma20":         round(last_vol_ma20, 0),
+        "above_daily_sma50":   above_daily_sma50,
+        "above_weekly_sma50":  above_weekly_sma50,
+        "above_weekly_sma200": above_weekly_sma200,
+        "volume_spike":        volume_spike,
+        "stop_a":              stop_a,
+        "stop_b":              stop_b,
+        "active_stop":         active_stop,
+        "entry_signal":        entry_signal,
+        "exit_signal":         exit_signal,
+        "weekly_exit_signal":  weekly_exit_signal,
+        "timestamp":           datetime.now(timezone.utc).isoformat(),
     }
 
-    # Structured log for easy parsing/analysis later
     logger.info(
-        f"[{symbol}] Close={last_close} SMA200={last_sma200} EMA50={last_ema50} "
-        f"RSI2={last_rsi2:.2f} (prev={prev_rsi2:.2f}) "
-        f"ATR={last_atr:.2f} | AboveSMA={above_sma200} AboveEMA={above_ema50} | "
-        f"Entry={entry_signal} Exit={exit_signal} | "
-        f"Stop_A={stop_a} Stop_B={stop_b}"
+        f"[{symbol}] Close={last_close} | "
+        f"SMA50d={last_sma50_d} above={above_daily_sma50} | "
+        f"SMA50w={last_weekly_sma50} SMA200w={last_weekly_sma200} "
+        f"above50w={above_weekly_sma50} above200w={above_weekly_sma200} | "
+        f"RSI2={last_rsi2:.2f} prev={prev_rsi2:.2f} xabove={rsi_crossed_above} | "
+        f"Vol={last_volume:,} VolMA={last_vol_ma20:,.0f} spike={volume_spike} | "
+        f"ATR={last_atr:.2f} Stop_A={stop_a} Stop_B={stop_b} | "
+        f"Entry={entry_signal} RsiExit={exit_signal} WeeklyExit={weekly_exit_signal}"
     )
 
     if entry_signal:
-        logger.info(
-            f"  ✅ ENTRY SIGNAL: {symbol} | Active stop ({config.ACTIVE_STOP_MULT}×ATR): {active_stop}"
-        )
+        logger.info(f"  ✅ ENTRY SIGNAL: {symbol} | Active stop ({config.ACTIVE_STOP_MULT}×ATR): {active_stop}")
     if exit_signal:
         logger.info(
-            f"  📤 EXIT SIGNAL:  {symbol} | RSI(2) crossed below {config.RSI_EXIT_THRESHOLD} "
-            f"(prev={prev_rsi2:.2f} → now={last_rsi2:.2f})"
+            f"  📤 RSI EXIT: {symbol} | RSI(2) crossed below {config.RSI_EXIT_THRESHOLD} "
+            f"({prev_rsi2:.2f} → {last_rsi2:.2f})"
+        )
+    if weekly_exit_signal:
+        logger.info(
+            f"  📤 WEEKLY EXIT: {symbol} | Close={last_close} below weekly SMA(200)={last_weekly_sma200}"
         )
 
     return result
@@ -143,10 +204,7 @@ def evaluate_symbol(symbol: str) -> dict:
 # ── Full Scan ─────────────────────────────────────────────────────────────────
 
 def run_scan() -> dict[str, dict]:
-    """
-    Scan all configured symbols.
-    Returns dict of symbol -> evaluation result for all symbols.
-    """
+    """Scan all configured symbols. Returns dict of symbol → evaluation result."""
     logger.info("=" * 60)
     logger.info(f"Post-close scan started | {datetime.now(timezone.utc).isoformat()}")
 
@@ -156,12 +214,20 @@ def run_scan() -> dict[str, dict]:
             results[symbol] = evaluate_symbol(symbol)
         except Exception as e:
             logger.error(f"Scan error for {symbol}: {e}", exc_info=True)
-            results[symbol] = {"symbol": symbol, "entry_signal": False, "exit_signal": False, "error": str(e)}
+            results[symbol] = {
+                "symbol": symbol, "entry_signal": False,
+                "exit_signal": False, "weekly_exit_signal": False,
+                "error": str(e),
+            }
 
-    entries = [s for s, r in results.items() if r.get("entry_signal")]
-    exits   = [s for s, r in results.items() if r.get("exit_signal")]
+    entries       = [s for s, r in results.items() if r.get("entry_signal")]
+    rsi_exits     = [s for s, r in results.items() if r.get("exit_signal")]
+    weekly_exits  = [s for s, r in results.items() if r.get("weekly_exit_signal")]
 
-    logger.info(f"Scan complete | Entry signals: {entries} | Exit signals: {exits}")
+    logger.info(
+        f"Scan complete | Entries: {entries} | "
+        f"RSI exits: {rsi_exits} | Weekly exits: {weekly_exits}"
+    )
     logger.info("=" * 60)
 
     return results

@@ -3,9 +3,11 @@ executor.py — All Alpaca API interactions: placing orders, confirming fills,
 placing hard stops, and submitting exits.
 
 Order flow for entries:
-  1. 9:25 AM → submit_entry() places a Market OPG (on open) buy order
-  2. 9:45 AM → confirm_fills_and_place_stops() checks if filled, then places
-               a GTC hard stop order on the exchange using the ACTUAL fill price
+  1. 9:25 AM → submit_entry() places a Limit OPG (LOO) buy order at prior close
+  2. 9:45 AM → confirm_fills_and_place_stops() checks if filled:
+               - Filled → places a GTC hard stop on the exchange using ACTUAL fill price
+               - Unfilled (order expired) → submits a DAY market buy as fallback
+               - Still pending → leaves it; will retry at next confirm cycle
 
 The hard stop sits on Alpaca's servers — it executes even if this bot crashes.
 """
@@ -41,19 +43,11 @@ def get_equity() -> float:
 
 
 # ── Market Calendar ───────────────────────────────────────────────────────────
-# Alpaca's calendar API is the single source of truth for which days the US
-# equities market is open. It already accounts for weekends, federal holidays,
-# and early-close days (e.g. day after Thanksgiving). We use it to skip the
-# scheduled jobs on non-trading days instead of trying to maintain our own
-# holiday table.
 
 def is_trading_day_today() -> bool:
     """Return True if today has (or had) a regular US equities trading session."""
     today = date.today()
-    # Calendar request for a one-day window — empty list means no session.
-    sessions = _client.get_calendar(
-        GetCalendarRequest(start=today, end=today)
-    )
+    sessions = _client.get_calendar(GetCalendarRequest(start=today, end=today))
     return len(sessions) > 0
 
 
@@ -72,23 +66,17 @@ def has_position(symbol: str) -> bool:
 
 def submit_entry(scan_result: dict) -> bool:
     """
-    Submit a Market OPG (next-day open) buy order for a given entry signal.
+    Submit a Limit OPG (LOO) buy order at prior close + ENTRY_LIMIT_PCT.
+    Position size is estimated using yesterday's close and the active stop.
+    The actual hard stop is placed after fill confirmation.
 
-    Position size is estimated using yesterday's close price + active stop.
-    The actual hard stop is placed after fill confirmation in confirm_fills_and_place_stops().
-
-    Args:
-        scan_result: Dict returned by scanner.evaluate_symbol() with entry_signal=True.
-
-    Returns:
-        True if order was successfully submitted, False otherwise.
+    Returns True if an order was successfully submitted, False otherwise.
     """
     symbol      = scan_result["symbol"]
     est_entry   = scan_result["close"]       # Yesterday's close — size estimate only
     active_stop = scan_result["active_stop"]
     stop_a      = scan_result["stop_a"]
     stop_b      = scan_result["stop_b"]
-    atr_val     = scan_result["atr14"]
 
     if has_position(symbol):
         logger.info(f"Skipping {symbol} entry — position already open.")
@@ -108,17 +96,16 @@ def submit_entry(scan_result: dict) -> bool:
                 symbol=symbol,
                 qty=shares,
                 side=OrderSide.BUY,
-                time_in_force=TimeInForce.OPG,  # LOO = Limit on Open
+                time_in_force=TimeInForce.OPG,  # LOO — Limit on Open
                 limit_price=limit_price,
             )
         )
 
         logger.info(
-            f"📥 BUY ORDER submitted | {symbol} | {shares} shares | "
+            f"📥 BUY LIMIT ORDER submitted | {symbol} | {shares} shares | "
             f"Est. entry=${est_entry:.2f} | Limit=${limit_price:.2f} | Order ID={order.id}"
         )
 
-        # Record position with estimated values — actual fill updates later
         pt.add(
             symbol=symbol,
             entry_price=est_entry,
@@ -127,10 +114,10 @@ def submit_entry(scan_result: dict) -> bool:
             stop_price_b=stop_b,
             shares=shares,
             stop_mult=config.ACTIVE_STOP_MULT,
-            stop_order_id=None,  # Set after fill confirmation
+            stop_order_id=None,
             rsi2=scan_result.get("rsi2"),
-            sma200=scan_result.get("sma200"),
-            ema50=scan_result.get("ema50"),
+            sma200_weekly=scan_result.get("sma200_weekly"),
+            sma50_daily=scan_result.get("sma50_daily"),
             atr14=scan_result.get("atr14"),
         )
         return True
@@ -145,16 +132,16 @@ def submit_entry(scan_result: dict) -> bool:
 def confirm_fills_and_place_stops():
     """
     Run ~15 minutes after open to:
-      1. Confirm buy orders have been filled.
-      2. Calculate stop price from ACTUAL fill price (not estimated).
-      3. Place a GTC hard stop order on the exchange.
+      1. Confirm LOO buy orders have been filled.
+      2. Calculate stop from ACTUAL fill price using ATR at signal time.
+      3. Place a GTC hard stop on the exchange.
 
-    This is the critical step — the hard stop is what protects the position
-    even if the bot crashes or loses connectivity.
+    If the LOO expired unfilled, submits a DAY market buy as fallback so the
+    position still opens (avoids missing a move just because of a tight LOO limit).
     """
     logger.info("Confirming fills and placing hard stops...")
 
-    tracked = pt.all_positions()
+    tracked          = pt.all_positions()
     alpaca_positions = get_alpaca_positions()
 
     for symbol, pos_data in tracked.items():
@@ -163,8 +150,7 @@ def confirm_fills_and_place_stops():
             continue
 
         if symbol not in alpaca_positions:
-            # Check whether an OPG buy order is still open (submitted but not yet
-            # processed by the exchange). If one is still live, don't interfere.
+            # Check whether an OPG order is still open (submitted but not yet processed)
             try:
                 open_orders = _client.get_orders(
                     GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
@@ -176,32 +162,56 @@ def confirm_fills_and_place_stops():
 
             if open_buys:
                 logger.info(
-                    f"{symbol}: OPG order still pending (ID={open_buys[0].id}). "
-                    f"Skipping fallback — will retry at next confirm."
+                    f"{symbol}: LOO order still pending (ID={open_buys[0].id}). "
+                    f"Skipping — will retry at next confirm cycle."
                 )
                 continue
 
-            # LOO entry expired unfilled — do not chase with a market order.
-            # The stock opened above our limit; entering now would be buying into
-            # a gap-up, which is the opposite of what this strategy wants.
-            logger.warning(
-                f"{symbol}: LOO entry expired unfilled — removing tracker record, will not chase."
-            )
-            pt.remove(symbol)
+            # LOO expired unfilled — submit market DAY buy as fallback so we don't miss the trade
+            shares = pos_data.get("shares", 0)
+            if shares > 0:
+                logger.warning(
+                    f"{symbol}: LOO entry expired unfilled. "
+                    f"Submitting fallback DAY market buy for {shares} shares..."
+                )
+                try:
+                    fallback = _client.submit_order(
+                        MarketOrderRequest(
+                            symbol=symbol,
+                            qty=shares,
+                            side=OrderSide.BUY,
+                            time_in_force=TimeInForce.DAY,
+                        )
+                    )
+                    logger.info(
+                        f"🔄 FALLBACK BUY submitted | {symbol} | {shares} shares | "
+                        f"Order ID={fallback.id}"
+                    )
+                except Exception as e:
+                    logger.error(f"Fallback buy failed for {symbol}: {e}", exc_info=True)
+                    pt.remove(symbol)
+            else:
+                logger.warning(f"{symbol}: LOO expired, no shares recorded — removing tracker record.")
+                pt.remove(symbol)
             continue
 
-        alpaca_pos  = alpaca_positions[symbol]
-        fill_price  = float(alpaca_pos.avg_entry_price)
-        shares      = int(float(alpaca_pos.qty))
-        atr_val     = (fill_price - pos_data["stop_price"]) / config.ACTIVE_STOP_MULT
-        actual_stop = round(fill_price - (config.ACTIVE_STOP_MULT * atr_val), 2)
+        # Position is open — calculate stop from actual fill price
+        alpaca_pos = alpaca_positions[symbol]
+        fill_price = float(alpaca_pos.avg_entry_price)
+        shares     = int(float(alpaca_pos.qty))
 
-        # Update tracker with actual fill price
+        # Use ATR stored at signal time so the stop distance is correct for this entry
+        atr_at_signal = pos_data.get("atr14_at_signal")
+        if atr_at_signal:
+            actual_stop = round(fill_price - (config.ACTIVE_STOP_MULT * float(atr_at_signal)), 2)
+        else:
+            # Fallback for positions recorded before atr14_at_signal was stored
+            actual_stop = pos_data["stop_price"]
+            logger.warning(f"{symbol}: atr14_at_signal not found, using estimated stop ${actual_stop:.2f}")
+
         pt.update_entry_price(symbol, fill_price)
 
-        # Place the hard stop on the exchange
         stop_order_id = _place_stop_order(symbol, actual_stop, shares)
-
         if stop_order_id:
             pt.update_stop_order_id(symbol, stop_order_id)
             logger.info(
@@ -213,16 +223,12 @@ def confirm_fills_and_place_stops():
 
 def confirm_exit_fills():
     """
-    Run ~15 minutes after open alongside confirm_fills_and_place_stops().
+    Run alongside confirm_fills_and_place_stops() at 9:45 ET.
 
-    Iterates all exit_pending positions from the tracker and resolves each:
-      - Position gone from Alpaca  → fill confirmed, remove from tracker.
-      - Open sell order still live → order in flight, leave as exit_pending.
-      - Position still held, no open sell → LOO expired unfilled; submit a
-        DAY market sell as fallback so the position is guaranteed to close.
-
-    Driving off the tracker (not order timestamps) means missed exits from
-    prior days are caught on the next scan cycle, not silently abandoned.
+    Resolves each exit_pending position:
+      - Position gone from Alpaca  → fill confirmed, log trade, remove from tracker.
+      - Open sell order still live → leave as exit_pending.
+      - Position held, no sell     → LOO expired; submit DAY market sell as fallback.
     """
     logger.info("Checking exit_pending positions for fill confirmation...")
 
@@ -235,7 +241,6 @@ def confirm_exit_fills():
 
     for symbol in exit_pending:
         if symbol not in alpaca_positions:
-            # Position is gone from Alpaca — fill confirmed.
             pos_data   = pt.get(symbol)
             exit_price = get_last_fill_price(symbol, side="sell")
             log_reason = (pos_data.get("exit_reason", "signal_exit") if pos_data else "signal_exit")
@@ -245,7 +250,6 @@ def confirm_exit_fills():
             pt.remove(symbol)
             continue
 
-        # Position still held — check for an open sell order.
         try:
             open_orders = _client.get_orders(
                 GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
@@ -262,7 +266,7 @@ def confirm_exit_fills():
             )
             continue
 
-        # No open sell and position still exists — LOO expired unfilled.
+        # LOO sell expired — submit DAY market sell as fallback
         shares = int(float(alpaca_positions[symbol].qty))
         logger.warning(
             f"{symbol}: LOO exit expired unfilled. "
@@ -282,10 +286,11 @@ def confirm_exit_fills():
                 f"🔄 FALLBACK SELL submitted | {symbol} | {shares} shares | "
                 f"Order ID={fallback.id}"
             )
-            # Log trade using estimated fill = last Alpaca position price.
-            # The actual fill will be close to market price at time of submission.
             if pos_data:
-                fallback_price = float(alpaca_positions[symbol].current_price or alpaca_positions[symbol].avg_entry_price)
+                fallback_price = float(
+                    alpaca_positions[symbol].current_price
+                    or alpaca_positions[symbol].avg_entry_price
+                )
                 log_reason = pos_data.get("exit_reason", "signal_exit") + "_fallback"
                 trade_log.log_closed_trade(pos_data, fallback_price, log_reason)
             pt.remove(symbol)
@@ -294,18 +299,10 @@ def confirm_exit_fills():
 
 
 def get_last_fill_price(symbol: str, side: str) -> float | None:
-    """
-    Return the filled_avg_price of the most recent filled order for symbol on
-    the given side ("buy" or "sell"). Returns None if no filled order is found.
-    Used to retrieve exit prices for trade logging.
-    """
+    """Return the filled_avg_price of the most recent filled order for symbol on the given side."""
     try:
         orders = _client.get_orders(
-            GetOrdersRequest(
-                status=QueryOrderStatus.CLOSED,
-                symbols=[symbol],
-                limit=10,
-            )
+            GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], limit=10)
         )
         for order in orders:
             if (str(order.side).lower() == side.lower()
@@ -318,10 +315,7 @@ def get_last_fill_price(symbol: str, side: str) -> float | None:
 
 
 def _place_stop_order(symbol: str, stop_price: float, shares: int) -> str | None:
-    """
-    Place a GTC hard stop (sell) order on the exchange.
-    This order lives on Alpaca's servers — it will trigger even if the bot is down.
-    """
+    """Place a GTC hard stop (sell) order on the exchange."""
     try:
         order = _client.submit_order(
             StopOrderRequest(
@@ -334,7 +328,6 @@ def _place_stop_order(symbol: str, stop_price: float, shares: int) -> str | None
         )
         logger.info(f"🛑 STOP ORDER placed | {symbol} | ${stop_price:.2f} | Order ID={order.id}")
         return str(order.id)
-
     except Exception as e:
         logger.error(f"Failed to place stop order for {symbol}: {e}", exc_info=True)
         return None
@@ -346,23 +339,14 @@ def submit_exit(symbol: str, reason: str = "signal", close_price: float = 0.0) -
     """
     Submit a LOO (Limit on Open) sell order for the next day's open.
     Cancels any open stop orders first to avoid a double-sell.
-    Marks the position as exit_pending instead of removing it immediately —
-    confirm_exit_fills() removes it once the fill is confirmed.
+    Marks the position as exit_pending — confirm_exit_fills() removes it after fill.
 
-    Args:
-        symbol:      Ticker to exit.
-        reason:      Human-readable exit reason for logging (e.g. 'rsi_exit', 'time_stop').
-        close_price: Prior session close used to set the LOO limit price.
-                     Falls back to market OPG if not provided.
-
-    Returns:
-        True if exit order submitted, False otherwise.
+    Returns True if exit order submitted, False otherwise.
     """
     if not has_position(symbol):
         logger.info(f"No open position in {symbol} — nothing to exit.")
         return False
 
-    # Cancel the hard stop FIRST to prevent a duplicate exit
     _cancel_stop_for_symbol(symbol)
 
     alpaca_positions = get_alpaca_positions()
@@ -377,16 +361,15 @@ def submit_exit(symbol: str, reason: str = "signal", close_price: float = 0.0) -
                     symbol=symbol,
                     qty=shares,
                     side=OrderSide.SELL,
-                    time_in_force=TimeInForce.OPG,  # LOO = Limit on Open
+                    time_in_force=TimeInForce.OPG,  # LOO — Limit on Open
                     limit_price=limit_price,
                 )
             )
             logger.info(
-                f"📤 SELL ORDER submitted | {symbol} | {shares} shares | "
+                f"📤 SELL LIMIT ORDER submitted | {symbol} | {shares} shares | "
                 f"Reason={reason} | Limit=${limit_price:.2f} | Order ID={order.id}"
             )
         else:
-            # No close price available — fall back to market OPG
             logger.warning(f"{symbol}: No close price for limit exit — submitting market OPG sell.")
             order = _client.submit_order(
                 MarketOrderRequest(
@@ -397,11 +380,10 @@ def submit_exit(symbol: str, reason: str = "signal", close_price: float = 0.0) -
                 )
             )
             logger.info(
-                f"📤 SELL ORDER submitted | {symbol} | {shares} shares | "
+                f"📤 SELL MARKET ORDER submitted | {symbol} | {shares} shares | "
                 f"Reason={reason} (market fallback) | Order ID={order.id}"
             )
 
-        # Mark as pending — do NOT remove yet. confirm_exit_fills() removes after fill.
         pt.mark_exit_pending(symbol, reason=reason)
         return True
 
@@ -411,7 +393,7 @@ def submit_exit(symbol: str, reason: str = "signal", close_price: float = 0.0) -
 
 
 def _cancel_stop_for_symbol(symbol: str):
-    """Cancel all open stop orders for a symbol before submitting a market exit."""
+    """Cancel all open stop orders for a symbol before submitting an exit."""
     stop_order_id = pt.get_stop_order_id(symbol)
 
     if stop_order_id:
@@ -422,7 +404,6 @@ def _cancel_stop_for_symbol(symbol: str):
         except Exception as e:
             logger.warning(f"Could not cancel stop by ID for {symbol}: {e}. Falling back to full scan.")
 
-    # Fallback: scan all open orders for this symbol
     try:
         open_orders = _client.get_orders(
             GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])

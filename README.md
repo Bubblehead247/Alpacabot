@@ -1,18 +1,32 @@
-# Mean Reversion Bot — SPY / QQQ / IWM
+# Mean Reversion Bot — 16-ETF Universe
 
-Connors-style RSI(2) mean reversion system targeting oversold pullbacks in bull-market conditions.
+Connors-style RSI(2) mean reversion system with multi-timeframe trend filtering and volume confirmation.
+
+## Trading Universe
+
+**Broad market (5):** SPY, QQQ, IWM, DIA, MDY
+
+**SPDR Sector / XL family (11):** XLC, XLY, XLP, XLE, XLF, XLV, XLI, XLB, XLRE, XLK, XLU
+
+---
 
 ## Strategy Logic
 
-**Entry:**
-- Close must be above SMA(200) — confirms bull market regime
-- Close must be above EMA(50) — secondary trend filter
-- RSI(2) must be ≤ 10 — captures maximum rubber-band stretch, not mild dips
+**Entry (all four must be true on the same day):**
+- Weekly gate: close above SMA(50,W) AND SMA(200,W) — structural trend must be intact
+- Daily trend: close above SMA(50,D)
+- RSI signal: RSI(2) crossed back **above** 10 today (prior bar ≤ 10, current bar > 10) — bounce confirmed, not catching a falling knife
+- Volume spike: today's volume > 1.5× the 20-day average — institutional participation required
 
-**Exit (first condition hit wins):**
-- RSI(2) crosses back below 70 (prior bar ≥ 70 AND current bar < 70) → market sell next open
-- Position held ≥ 7 calendar days → time stop, market sell next open
-- Hard stop (ATR-based) hit intraday → exchange-level stop order executes immediately
+**Exit (first condition hit wins, in priority order):**
+- Hard stop: ATR-based GTC stop order on exchange — executes intraday, no bot required
+- Time stop: position held ≥ 7 calendar days → limit sell next open, market fallback by 09:45 ET
+- Weekly trend break: close drops below weekly SMA(200) → limit sell next open, market fallback by 09:45 ET
+- RSI target: RSI(2) crosses back below 70 (prior bar ≥ 70, current bar < 70) → limit sell next open, market fallback by 09:45 ET
+
+**Order execution:**
+- Entries: LOO limit at prior close + 0.5% submitted at 09:25 ET; unfilled limits replaced with DAY market order at 09:45 ET
+- Exits: LOO limit at prior close − 0.5% submitted at 09:25 ET; unfilled limits replaced with DAY market sell at 09:45 ET
 
 **Risk:**
 - 1% of account equity risked per trade (hard max — never exceeded)
@@ -33,13 +47,12 @@ Connors-style RSI(2) mean reversion system targeting oversold pullbacks in bull-
 pip install -r requirements.txt
 ```
 
-### 2. Set environment variables
-```bash
-export ALPACA_API_KEY="your_key"
-export ALPACA_SECRET_KEY="your_secret"
+### 2. Set credentials
+Create `alpaca.env` in the project directory:
 ```
-
-Or edit `config.py` directly (not recommended for production).
+ALPACA_API_KEY=your_key
+ALPACA_SECRET_KEY=your_secret
+```
 
 ### 3. Configure
 Edit `config.py` to adjust:
@@ -60,27 +73,31 @@ The bot runs continuously and logs to both `bot.log` and stdout.
 
 ## Daily Schedule (Eastern Time)
 
-| Time  | Job                   | Description                                                |
-|-------|-----------------------|------------------------------------------------------------|
-| 16:30 | Post-close scan       | Evaluate all symbols, queue entry/exit actions             |
-| 09:25 | Pre-open execute      | Submit Market OPG orders (fills at opening auction)        |
-| 09:45 | Fill confirm + stops  | Verify fills, place GTC hard stop orders on the exchange   |
+| Time  | Job                  | Description                                                              |
+|-------|----------------------|--------------------------------------------------------------------------|
+| 16:30 | Post-close scan      | Evaluate all 16 symbols, queue entry/exit actions                        |
+| 09:25 | Pre-open execute     | Submit LOO limit orders (entries + exits) for next open                  |
+| 09:45 | Fill confirm + stops | Verify fills, place GTC hard stops; replace unfilled limits with market  |
 
 ---
 
 ## File Structure
 
 ```
-mean_reversion_bot/
+MeansRev/
 ├── config.py           # All tunable parameters — start here
 ├── indicators.py       # RSI, SMA, ATR calculations (pure pandas)
-├── scanner.py          # Fetches bars, evaluates entry/exit signals
+├── scanner.py          # Fetches daily + weekly bars, evaluates all signals
 ├── risk.py             # Position sizing math
 ├── position_tracker.py # JSON persistence for open position metadata
-├── executor.py         # All Alpaca API interactions
+├── executor.py         # All Alpaca API interactions and order logic
 ├── main.py             # Scheduler and main loop
+├── trade_log.py        # Appends closed trades to trades.csv
+├── notifier.py         # ntfy.sh push alerts
 ├── requirements.txt    # Python dependencies
-└── positions.json      # Auto-generated — tracks open positions
+├── positions.json      # Auto-generated — tracks open positions
+├── trades.csv          # Auto-generated — closed trade history
+└── old_code/           # Previous version of all bot files
 ```
 
 ---
