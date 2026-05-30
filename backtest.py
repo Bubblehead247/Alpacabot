@@ -25,6 +25,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from alpaca.data.historical import StockHistoricalDataClient
@@ -155,16 +156,80 @@ def weekly_smas_daily(bars: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     return w50_daily, w200_daily
 
 
+# ── Per-Symbol Precompute ─────────────────────────────────────────────────────
+
+@dataclass
+class PrecomputedSymbol:
+    """
+    Every indicator a symbol needs, computed once and materialised as float64
+    numpy arrays. `backtest_symbol` runs once per stop variant, but none of these
+    series depend on the stop multiplier — so we compute them a single time here
+    and index plain arrays in the hot loop (no pandas .iloc/scalar boxing).
+    """
+    symbol:   str
+    dates:    pd.DatetimeIndex
+    opens:    np.ndarray
+    close:    np.ndarray
+    low:      np.ndarray
+    volume:   np.ndarray
+    rsi2:     np.ndarray
+    atr14:    np.ndarray
+    sma50_d:  np.ndarray
+    vol_ma:   np.ndarray
+    w50_d:    np.ndarray
+    w200_d:   np.ndarray
+    start_i:  int
+    n:        int
+
+
+def precompute_symbol(symbol: str, bars: pd.DataFrame) -> PrecomputedSymbol:
+    """Compute indicators once per symbol and return numpy arrays for the loop."""
+    close_s = bars["close"]
+    sma50_d = sma(close_s, config.SMA_DAILY)
+    rsi2    = rsi(close_s, config.RSI_PERIOD)
+    atr14   = atr(bars["high"], bars["low"], close_s, config.ATR_PERIOD)
+    vol_ma  = sma(bars["volume"], config.VOLUME_MA_PERIOD)
+    w50_d, w200_d = weekly_smas_daily(bars)
+
+    w200_np = w200_d.to_numpy(dtype=float)
+    n = len(bars)
+
+    # Warmup: need enough bars for daily SMA50, ATR, volume MA, and a valid weekly SMA200.
+    warmup  = max(config.SMA_DAILY, config.ATR_PERIOD, config.VOLUME_MA_PERIOD) + 5
+    start_i = warmup
+    # Advance start until the weekly SMA200 series has warmed up too.
+    while start_i < n and np.isnan(w200_np[start_i]):
+        start_i += 1
+
+    return PrecomputedSymbol(
+        symbol  = symbol,
+        dates   = bars.index,
+        opens   = bars["open"].to_numpy(dtype=float),
+        close   = close_s.to_numpy(dtype=float),
+        low     = bars["low"].to_numpy(dtype=float),
+        volume  = bars["volume"].to_numpy(dtype=float),
+        rsi2    = rsi2.to_numpy(dtype=float),
+        atr14   = atr14.to_numpy(dtype=float),
+        sma50_d = sma50_d.to_numpy(dtype=float),
+        vol_ma  = vol_ma.to_numpy(dtype=float),
+        w50_d   = w50_d.to_numpy(dtype=float),
+        w200_d  = w200_np,
+        start_i = start_i,
+        n       = n,
+    )
+
+
 # ── Core Backtest Engine ──────────────────────────────────────────────────────
 
 def backtest_symbol(
-    symbol: str,
-    bars: pd.DataFrame,
+    data: PrecomputedSymbol,
     stop_mult: float,
     initial_equity: float = 100_000.0,
 ) -> BacktestResult:
     """
     Simulate the LIVE strategy (matches scanner.py) on one symbol + stop multiplier.
+
+    Takes a PrecomputedSymbol so indicators are shared across stop variants.
 
     Entry (ALL must pass, signal at close → buy next open):
       Weekly gate:  Close > weekly SMA(50) AND Close > weekly SMA(200)
@@ -179,28 +244,23 @@ def backtest_symbol(
       Weekly break: Close < weekly SMA(200) → exit next open                 [High]
       RSI target:   RSI(2) crossed back BELOW 70 (prev >= 70, now < 70)      [Standard]
     """
+    symbol        = data.symbol
     variant_label = f"{stop_mult}x"
-    logger.info(f"Backtesting {symbol} | Stop: {stop_mult}×ATR | Bars: {len(bars)}")
+    logger.info(f"Backtesting {symbol} | Stop: {stop_mult}×ATR | Bars: {data.n}")
 
-    close  = bars["close"]
-    high   = bars["high"]
-    low    = bars["low"]
-    opens  = bars["open"]
-    volume = bars["volume"]
-    dates  = bars.index
-
-    sma50_d  = sma(close, config.SMA_DAILY)
-    rsi2     = rsi(close, config.RSI_PERIOD)
-    atr14    = atr(high, low, close, config.ATR_PERIOD)
-    vol_ma   = sma(volume, config.VOLUME_MA_PERIOD)
-    w50_d, w200_d = weekly_smas_daily(bars)
-
-    # Warmup: need enough bars for daily SMA50, ATR, volume MA, and a valid weekly SMA200.
-    warmup = max(config.SMA_DAILY, config.ATR_PERIOD, config.VOLUME_MA_PERIOD) + 5
-    start_i = warmup
-    # Advance start until the weekly SMA200 series has warmed up too.
-    while start_i < len(bars) and pd.isna(w200_d.iloc[start_i]):
-        start_i += 1
+    opens   = data.opens
+    close   = data.close
+    low     = data.low
+    volume  = data.volume
+    rsi2    = data.rsi2
+    atr14   = data.atr14
+    sma50_d = data.sma50_d
+    vol_ma  = data.vol_ma
+    w50_d   = data.w50_d
+    w200_d  = data.w200_d
+    dates   = data.dates
+    n       = data.n
+    start_i = data.start_i
 
     equity        = initial_equity
     trades        = []
@@ -213,15 +273,15 @@ def backtest_symbol(
     peak_equity   = initial_equity
     max_drawdown  = 0.0
 
-    for i in range(start_i, len(bars)):
+    for i in range(start_i, n):
         date_str   = str(dates[i].date())
-        day_open   = float(opens.iloc[i])
-        day_close  = float(close.iloc[i])
-        day_low    = float(low.iloc[i])
-        cur_rsi    = float(rsi2.iloc[i])
-        prev_rsi   = float(rsi2.iloc[i - 1])
-        cur_atr    = float(atr14.iloc[i])
-        cur_w200   = float(w200_d.iloc[i]) if not pd.isna(w200_d.iloc[i]) else None
+        day_open   = opens[i]
+        day_close  = close[i]
+        day_low    = low[i]
+        cur_rsi    = rsi2[i]
+        prev_rsi   = rsi2[i - 1]
+        cur_atr    = atr14[i]
+        cur_w200   = w200_d[i] if not np.isnan(w200_d[i]) else None
 
         # ── Check Exits First (if in position) ──────────────────────────────
         if in_position:
@@ -240,12 +300,12 @@ def backtest_symbol(
                 exit_reason = "time_stop"
 
             # Priority 3: Weekly trend break — prior close below weekly SMA(200)
-            elif cur_w200 is not None and float(close.iloc[i - 1]) < float(w200_d.iloc[i - 1]):
+            elif cur_w200 is not None and close[i - 1] < w200_d[i - 1]:
                 exit_price  = day_open
                 exit_reason = "weekly_exit"
 
             # Priority 4: RSI exit — RSI(2) crossed back below 70 at prior close
-            elif (float(rsi2.iloc[i - 2]) >= config.RSI_EXIT_THRESHOLD
+            elif (rsi2[i - 2] >= config.RSI_EXIT_THRESHOLD
                   and prev_rsi < config.RSI_EXIT_THRESHOLD):
                 exit_price  = day_open
                 exit_reason = "rsi_exit"
@@ -259,14 +319,14 @@ def backtest_symbol(
                     symbol=symbol,
                     stop_variant=variant_label,
                     entry_date=str(entry_date),
-                    entry_price=round(entry_price, 2),
+                    entry_price=round(float(entry_price), 2),
                     exit_date=date_str,
-                    exit_price=round(exit_price, 2),
+                    exit_price=round(float(exit_price), 2),
                     shares=shares,
                     exit_reason=exit_reason,
-                    stop_price=round(stop_price, 2),
-                    pnl_dollars=round(pnl_dollars, 2),
-                    pnl_pct=round(pnl_pct, 2),
+                    stop_price=round(float(stop_price), 2),
+                    pnl_dollars=round(float(pnl_dollars), 2),
+                    pnl_pct=round(float(pnl_pct), 2),
                     hold_days=days_held,
                 )
                 trades.append(trade)
@@ -274,20 +334,20 @@ def backtest_symbol(
 
         # ── Check Entry (only if flat) ───────────────────────────────────────
         if not in_position:
-            w50  = float(w50_d.iloc[i])  if not pd.isna(w50_d.iloc[i])  else None
+            w50  = w50_d[i]  if not np.isnan(w50_d[i])  else None
             weekly_ok = (cur_w200 is not None and w50 is not None
                          and day_close > w50 and day_close > cur_w200)
-            above_daily_sma = day_close > float(sma50_d.iloc[i]) if not pd.isna(sma50_d.iloc[i]) else False
+            above_daily_sma = day_close > sma50_d[i] if not np.isnan(sma50_d[i]) else False
             rsi_cross_above = (prev_rsi <= config.RSI_ENTRY_THRESHOLD) and (cur_rsi > config.RSI_ENTRY_THRESHOLD)
-            vol_spike = (not pd.isna(vol_ma.iloc[i])
-                         and float(volume.iloc[i]) > config.VOLUME_SPIKE_MULT * float(vol_ma.iloc[i]))
+            vol_spike = (not np.isnan(vol_ma[i])
+                         and volume[i] > config.VOLUME_SPIKE_MULT * vol_ma[i])
             vol_ok = vol_spike if config.USE_VOLUME_FILTER else True
 
             if (weekly_ok and above_daily_sma and rsi_cross_above and vol_ok
-                    and not pd.isna(cur_atr)):
+                    and not np.isnan(cur_atr)):
                 # Enter at next bar's open — use next day's open if available
-                if i + 1 < len(bars):
-                    entry_price  = float(opens.iloc[i + 1])
+                if i + 1 < n:
+                    entry_price  = opens[i + 1]
                     entry_date   = dates[i + 1].date()
                     entry_idx    = i + 1
                 else:
@@ -335,7 +395,7 @@ def backtest_symbol(
     total_return = (equity - initial_equity) / initial_equity * 100
 
     # CAGR — annualized from actual number of trading days simulated
-    n_bars  = len(bars) - start_i
+    n_bars  = n - start_i
     n_years = n_bars / 252
     cagr    = ((equity / initial_equity) ** (1 / n_years) - 1) * 100 if n_years > 0 and equity > 0 else 0
 
@@ -344,10 +404,10 @@ def backtest_symbol(
     return BacktestResult(
         symbol=symbol,
         stop_variant=variant_label,
-        start_date=str(bars.index[start_i].date()) if start_i < len(bars) else str(bars.index[-1].date()),
-        end_date=str(bars.index[-1].date()),
+        start_date=str(dates[start_i].date()) if start_i < n else str(dates[-1].date()),
+        end_date=str(dates[-1].date()),
         initial_equity=initial_equity,
-        final_equity=round(equity, 2),
+        final_equity=round(float(equity), 2),
         total_trades=len(trades),
         winning_trades=len(winners),
         losing_trades=len(losers),
@@ -355,9 +415,9 @@ def backtest_symbol(
         avg_win_pct=round(avg_win, 2),
         avg_loss_pct=round(avg_loss, 2),
         profit_factor=round(pf, 2),
-        max_drawdown_pct=round(max_drawdown, 2),
-        cagr_pct=round(cagr, 2),
-        total_return_pct=round(total_return, 2),
+        max_drawdown_pct=round(float(max_drawdown), 2),
+        cagr_pct=round(float(cagr), 2),
+        total_return_pct=round(float(total_return), 2),
         avg_hold_days=round(avg_hold, 1),
         rsi_exits=sum(1 for t in trades if t.exit_reason == "rsi_exit"),
         stop_exits=sum(1 for t in trades if t.exit_reason == "stop_loss"),
@@ -465,8 +525,9 @@ def run_backtest(
             )
             continue
 
+        data = precompute_symbol(symbol, bars)
         for stop_mult in [config.STOP_MULT_A, config.STOP_MULT_B]:
-            result = backtest_symbol(symbol, bars, stop_mult, initial_equity)
+            result = backtest_symbol(data, stop_mult, initial_equity)
             print_result(result)
             all_results.append(result)
             all_trades.extend(result.trades)
