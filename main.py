@@ -227,6 +227,10 @@ def main():
         logger.info(f"  Volume filter:    ON — volume > {config.VOLUME_SPIKE_MULT}× MA({config.VOLUME_MA_PERIOD})")
     else:
         logger.info(f"  Volume filter:    OFF (logged only; see config.USE_VOLUME_FILTER)")
+    if config.USE_REGIME_FILTER:
+        logger.info(f"  Regime filter:    ON — weekly ADX({config.REGIME_ADX_PERIOD}) in [{config.REGIME_ADX_MIN}, {config.REGIME_ADX_MAX})")
+    else:
+        logger.info(f"  Regime filter:    OFF (logged only; see config.USE_REGIME_FILTER)")
     logger.info(f"  Active stop:      {config.ACTIVE_STOP_MULT}× ATR({config.ATR_PERIOD})")
     logger.info(f"  Tracking stop A:  {config.STOP_MULT_A}× ATR (logged, not traded)")
     logger.info(f"  Tracking stop B:  {config.STOP_MULT_B}× ATR (logged, not traded)")
