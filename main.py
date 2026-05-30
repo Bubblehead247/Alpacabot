@@ -223,7 +223,10 @@ def main():
     logger.info(f"  Daily trend:      Close > SMA({config.SMA_DAILY},D)")
     logger.info(f"  RSI(2) entry:     crosses ABOVE {config.RSI_ENTRY_THRESHOLD} (prev <= {config.RSI_ENTRY_THRESHOLD})")
     logger.info(f"  RSI(2) exit:      crosses below {config.RSI_EXIT_THRESHOLD} (prev >= {config.RSI_EXIT_THRESHOLD})")
-    logger.info(f"  Volume filter:    volume > {config.VOLUME_SPIKE_MULT}× MA({config.VOLUME_MA_PERIOD})")
+    if config.USE_VOLUME_FILTER:
+        logger.info(f"  Volume filter:    ON — volume > {config.VOLUME_SPIKE_MULT}× MA({config.VOLUME_MA_PERIOD})")
+    else:
+        logger.info(f"  Volume filter:    OFF (logged only; see config.USE_VOLUME_FILTER)")
     logger.info(f"  Active stop:      {config.ACTIVE_STOP_MULT}× ATR({config.ATR_PERIOD})")
     logger.info(f"  Tracking stop A:  {config.STOP_MULT_A}× ATR (logged, not traded)")
     logger.info(f"  Tracking stop B:  {config.STOP_MULT_B}× ATR (logged, not traded)")
