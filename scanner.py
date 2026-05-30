@@ -7,6 +7,8 @@ Entry (ALL must pass):
   RSI signal:    RSI(2) crossed back ABOVE 10 today (prev <= 10, now > 10)
   Volume:        Optional — today's volume > 1.5× the 20-day average
                  (only enforced when config.USE_VOLUME_FILTER is True)
+  Regime:        Optional — weekly ADX in [REGIME_ADX_MIN, REGIME_ADX_MAX)
+                 (only enforced when config.USE_REGIME_FILTER is True)
 
 Exit (first triggered wins, checked in this priority order):
   Weekly break:  Close < SMA(200,W)  — structural trend broken        [High]
@@ -24,7 +26,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 import config
-from indicators import sma, rsi, atr
+from indicators import sma, rsi, atr, adx
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,7 @@ def evaluate_symbol(symbol: str) -> dict:
     above_weekly_sma200 = False
     last_weekly_sma50   = 0.0
     last_weekly_sma200  = 0.0
+    last_weekly_adx     = 0.0
 
     try:
         weekly_bars = fetch_weekly_bars(symbol)
@@ -125,8 +128,10 @@ def evaluate_symbol(symbol: str) -> dict:
             w_close  = weekly_bars["close"]
             w_sma50  = sma(w_close, config.SMA_WEEKLY_FAST)
             w_sma200 = sma(w_close, config.SMA_WEEKLY_SLOW)
+            w_adx    = adx(weekly_bars["high"], weekly_bars["low"], w_close, config.REGIME_ADX_PERIOD)
             last_weekly_sma50  = round(float(w_sma50.iloc[-1]),  2)
             last_weekly_sma200 = round(float(w_sma200.iloc[-1]), 2)
+            last_weekly_adx    = round(float(w_adx.iloc[-1]),    2)
             above_weekly_sma50  = last_close > last_weekly_sma50
             above_weekly_sma200 = last_close > last_weekly_sma200
         else:
@@ -147,7 +152,12 @@ def evaluate_symbol(symbol: str) -> dict:
     # ── Signal logic ──────────────────────────────────────────────────────────
     # Volume spike is an optional confirmation (see config.USE_VOLUME_FILTER).
     volume_ok          = volume_spike if config.USE_VOLUME_FILTER else True
-    entry_signal       = weekly_trend_ok and above_daily_sma50 and rsi_crossed_above and volume_ok
+    # Regime gate: weekly ADX must sit in the moderate-trend band (see
+    # config.USE_REGIME_FILTER). If weekly data was missing, last_weekly_adx is
+    # 0.0 → fails the band, blocking entry (conservative — matches weekly gate).
+    regime_ok          = (config.REGIME_ADX_MIN <= last_weekly_adx < config.REGIME_ADX_MAX
+                          ) if config.USE_REGIME_FILTER else True
+    entry_signal       = weekly_trend_ok and above_daily_sma50 and rsi_crossed_above and volume_ok and regime_ok
     exit_signal        = rsi_crossed_below
     weekly_exit_signal = not above_weekly_sma200  # close below weekly SMA(200)
 
@@ -157,6 +167,7 @@ def evaluate_symbol(symbol: str) -> dict:
         "sma50_daily":         last_sma50_d,
         "sma50_weekly":        last_weekly_sma50,
         "sma200_weekly":       last_weekly_sma200,
+        "weekly_adx":          last_weekly_adx,
         "rsi2":                last_rsi2,
         "prev_rsi2":           prev_rsi2,
         "atr14":               last_atr,
@@ -165,6 +176,7 @@ def evaluate_symbol(symbol: str) -> dict:
         "above_daily_sma50":   above_daily_sma50,
         "above_weekly_sma50":  above_weekly_sma50,
         "above_weekly_sma200": above_weekly_sma200,
+        "regime_ok":           regime_ok,
         "volume_spike":        volume_spike,
         "stop_a":              stop_a,
         "stop_b":              stop_b,
@@ -180,6 +192,7 @@ def evaluate_symbol(symbol: str) -> dict:
         f"SMA50d={last_sma50_d} above={above_daily_sma50} | "
         f"SMA50w={last_weekly_sma50} SMA200w={last_weekly_sma200} "
         f"above50w={above_weekly_sma50} above200w={above_weekly_sma200} | "
+        f"ADXw={last_weekly_adx} regime_ok={regime_ok} | "
         f"RSI2={last_rsi2:.2f} prev={prev_rsi2:.2f} xabove={rsi_crossed_above} | "
         f"Vol={last_volume:,} VolMA={last_vol_ma20:,.0f} spike={volume_spike} | "
         f"ATR={last_atr:.2f} Stop_A={stop_a} Stop_B={stop_b} | "

@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 import config
 import backtest as bt
@@ -83,6 +84,7 @@ _OVERRIDABLE = (
     "SMA_DAILY", "SMA_WEEKLY_FAST", "SMA_WEEKLY_SLOW",
     "ATR_PERIOD", "VOLUME_MA_PERIOD", "VOLUME_SPIKE_MULT", "USE_VOLUME_FILTER",
     "RISK_PER_TRADE", "MAX_HOLD_DAYS", "SLIPPAGE_PCT",
+    "USE_REGIME_FILTER", "REGIME_ADX_PERIOD", "REGIME_ADX_MIN", "REGIME_ADX_MAX",
 )
 
 
@@ -362,6 +364,161 @@ def monte_carlo(trades, base_m, n_books, iters=5000, seed=42):
           f"{'edge > 0 ✓' if lo > 0 else 'CI includes 0 ✗'}")
 
 
+# ── Regime study (step 1: measure before filtering) ───────────────────────────
+
+def _weekly_regime_daily(df, er_period, adx_period):
+    """ADX + Efficiency Ratio on W-FRI weekly bars, forward-filled onto the daily
+    index (same alignment the weekly SMA gate uses — a daily bar only ever sees
+    the most recently completed week, so no lookahead)."""
+    from indicators import efficiency_ratio, adx as adx_ind
+    wk = pd.DataFrame({
+        "high":  df["high"].resample("W-FRI").max(),
+        "low":   df["low"].resample("W-FRI").min(),
+        "close": df["close"].resample("W-FRI").last(),
+    }).dropna()
+    er = efficiency_ratio(wk["close"], er_period).reindex(df.index, method="ffill")
+    ax = adx_ind(wk["high"], wk["low"], wk["close"], adx_period).reindex(df.index, method="ffill")
+    return er.to_numpy(dtype=float), ax.to_numpy(dtype=float)
+
+
+def _tag_trades_with_regime(bars, trades, er_period=10, adx_period=14):
+    """
+    Attach DAILY and WEEKLY trend regime (Efficiency Ratio + ADX) to each trade,
+    measured as of the SIGNAL bar — the trading day BEFORE entry. (Entry fills at
+    the next open, so the decision is made on the prior close; using that bar
+    avoids lookahead.)
+
+    Returns list of (trade, regime_dict); trades whose signal-bar regime is NaN
+    (warmup) are dropped. regime_dict keys: ER_d, ADX_d, ER_w, ADX_w.
+    """
+    from indicators import efficiency_ratio, adx as adx_ind
+
+    cache = {}
+    for sym, df in bars.items():
+        er_d = efficiency_ratio(df["close"], er_period).to_numpy(dtype=float)
+        ax_d = adx_ind(df["high"], df["low"], df["close"], adx_period).to_numpy(dtype=float)
+        er_w, ax_w = _weekly_regime_daily(df, er_period, adx_period)
+        pos = {ts.date().isoformat(): i for i, ts in enumerate(df.index)}
+        cache[sym] = (er_d, ax_d, er_w, ax_w, pos)
+
+    tagged = []
+    for t in trades:
+        er_d, ax_d, er_w, ax_w, pos = cache[t.symbol]
+        p = pos.get(t.entry_date)
+        if p is None or p == 0:
+            continue
+        s = p - 1                       # signal bar = day before entry
+        reg = {"ER_d": er_d[s], "ADX_d": ax_d[s], "ER_w": er_w[s], "ADX_w": ax_w[s]}
+        if any(np.isnan(v) for v in reg.values()):
+            continue
+        tagged.append((t, reg))
+    return tagged
+
+
+def _trip(trades):
+    """Compact 'n/PF/avgT%' cell for a bucket."""
+    b = _bucket_metrics(trades, "")
+    pf = "inf" if b["profit_factor"] == float("inf") else f"{b['profit_factor']:.2f}"
+    return f"{b['trades']}/{pf}/{b['avg_trade_pct']:+.3f}"
+
+
+def _validate_table(title, buckets, mid, study, rows):
+    """buckets: list of (label, [trades]). Prints full / in-sample / OOS triplets
+    so we can see whether a bucket's edge holds in BOTH halves of history."""
+    print(f"\n  ► {title}")
+    print(f"  {'bucket':<22}{'full n/PF/avgT':>20}{'in-sample':>20}{'out-of-sample':>20}")
+    for label, sub in buckets:
+        isamp = [t for t in sub if t.entry_date <  mid]
+        oos   = [t for t in sub if t.entry_date >= mid]
+        print(f"  {label:<22}{_trip(sub):>20}{_trip(isamp):>20}{_trip(oos):>20}")
+        for tag, grp in (("full", sub), ("in_sample", isamp), ("oos", oos)):
+            b = _bucket_metrics(grp, label)
+            rows.append({"study": study, "split": tag, **b})
+
+
+def regime_study(bars, base_stop, er_period=10, adx_period=14):
+    """
+    Step 1: does the edge live in a particular trend regime — and does it hold
+    OUT of sample? Bucket realized trades by DAILY and WEEKLY trend strength
+    (measured at the signal bar), and split each bucket in/out of sample.
+    We MEASURE here — no rule change yet.
+    """
+    print("\n" + "=" * 96)
+    print(f"  REGIME STUDY  —  daily & weekly trend strength at the signal bar, "
+          f"validated in/out of sample")
+    print(f"  (ER period={er_period}, ADX period={adx_period}, stop={base_stop}×)")
+    print("=" * 96)
+
+    _, trades = run_universe(bars, base_stop)
+    tagged = _tag_trades_with_regime(bars, trades, er_period, adx_period)
+    ds = sorted(t.entry_date for t, _ in tagged)
+    mid = ds[len(ds) // 2]
+    print(f"\n  {len(tagged)} of {len(trades)} trades tagged (rest dropped to warmup NaN).")
+    print(f"  In/out-of-sample split @ {mid}  "
+          f"(IS: {sum(d < mid for d in ds)} trades, OOS: {sum(d >= mid for d in ds)}).")
+    print(f"  Read each cell as  n/PF/avgT% .  A robust bucket wins in BOTH halves.")
+
+    rows = []
+    for tf, tflabel in (("d", "DAILY"), ("w", "WEEKLY")):
+        # ADX textbook thresholds — the actionable, comparable cut --------------
+        b_lo, b_mid, b_hi = [], [], []
+        for t, reg in tagged:
+            a = reg[f"ADX_{tf}"]
+            bucket = b_lo if a < 20 else b_mid if a < 25 else b_hi
+            bucket.append(t)
+        _validate_table(
+            f"{tflabel} ADX threshold",
+            [("ADX <20 (no trend)", b_lo), ("ADX 20–25 (transit.)", b_mid),
+             ("ADX ≥25 (trending)", b_hi)],
+            mid, f"ADX_{tf}_threshold", rows)
+
+        # Efficiency Ratio terciles — fixed full-sample cuts (comparable halves) -
+        er_vals = [reg[f"ER_{tf}"] for _, reg in tagged]
+        c_lo, c_hi = np.nanpercentile(er_vals, [33, 67])
+        g1, g2, g3 = [], [], []
+        for t, reg in tagged:
+            e = reg[f"ER_{tf}"]
+            (g1 if e <= c_lo else g2 if e <= c_hi else g3).append(t)
+        _validate_table(
+            f"{tflabel} ER tercile  (cuts {c_lo:.2f} / {c_hi:.2f})",
+            [("ER low (chop)", g1), ("ER mid", g2), ("ER high (trend)", g3)],
+            mid, f"ER_{tf}_tercile", rows)
+
+    _write_csv("regime_buckets.csv", rows)
+
+
+def filter_comparison(bars, base_stop):
+    """
+    Measure the weekly-ADX regime filter end-to-end: an OFF-vs-ON headline at live
+    slippage, then the FULL robustness+slippage suite run on the FILTERED strategy
+    (so its in/out-of-sample, regime, leave-one-out, slippage and Monte-Carlo all
+    reflect the filter). The decision should rest on these numbers, not a bucket.
+    """
+    print("\n" + "=" * 96)
+    print(f"  REGIME FILTER — net effect  (weekly ADX in "
+          f"[{config.REGIME_ADX_MIN:.0f}, {config.REGIME_ADX_MAX:.0f}), "
+          f"slippage {config.SLIPPAGE_PCT * 10000:.0f} bps/side, stop {base_stop}×)")
+    print("=" * 96)
+
+    off_m, off_tr = run_universe(bars, base_stop)
+    on_m,  on_tr  = run_universe(bars, base_stop, overrides={"USE_REGIME_FILTER": True})
+
+    print("\n  Headline (full sample, live slippage):")
+    print(HDR)
+    print(fmt_row("filter OFF (baseline)", off_m))
+    print(fmt_row("filter ON  (ADX band)", on_m))
+    kept = on_m["trades"] / off_m["trades"] * 100 if off_m["trades"] else 0
+    print(f"\n  Filter keeps {on_m['trades']}/{off_m['trades']} trades ({kept:.0f}%).")
+
+    print("\n  ── Full robustness+slippage suite on the FILTERED strategy ──")
+    saved = config.USE_REGIME_FILTER
+    config.USE_REGIME_FILTER = True
+    try:
+        robustness_study(bars, base_stop)
+    finally:
+        config.USE_REGIME_FILTER = saved
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _write_csv(name, rows):
@@ -386,7 +543,7 @@ def main():
     ap.add_argument("--stop", type=float, default=config.ACTIVE_STOP_MULT,
                     help="Baseline stop multiplier (default: config.ACTIVE_STOP_MULT)")
     ap.add_argument("--refresh", action="store_true", help="Refetch bars, ignore cache")
-    ap.add_argument("--only", choices=["sensitivity", "robustness"], default=None)
+    ap.add_argument("--only", choices=["sensitivity", "robustness", "regime", "filter"], default=None)
     args = ap.parse_args()
 
     # Quiet the engine's per-symbol INFO logging — we run it hundreds of times.
@@ -399,10 +556,14 @@ def main():
         print("No bars loaded.")
         return
 
-    if args.only != "robustness":
+    if args.only in (None, "sensitivity"):
         sensitivity_study(bars, args.stop)
-    if args.only != "sensitivity":
+    if args.only in (None, "robustness"):
         robustness_study(bars, args.stop)
+    if args.only in (None, "regime"):
+        regime_study(bars, args.stop)
+    if args.only == "filter":
+        filter_comparison(bars, args.stop)
 
 
 if __name__ == "__main__":

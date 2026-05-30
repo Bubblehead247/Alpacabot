@@ -34,7 +34,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 import config
-from indicators import sma, rsi, atr
+from indicators import sma, rsi, atr, adx
 
 logging.basicConfig(
     level=logging.INFO,
@@ -156,6 +156,22 @@ def weekly_smas_daily(bars: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     return w50_daily, w200_daily
 
 
+def weekly_adx_daily(bars: pd.DataFrame, period: int) -> pd.Series:
+    """
+    Weekly ADX (trend strength) forward-filled onto the daily index — same
+    W-FRI alignment as the weekly SMA gate, so a daily bar only ever sees the
+    most recently completed week (no lookahead). Used by the optional regime
+    filter (config.USE_REGIME_FILTER).
+    """
+    wk = pd.DataFrame({
+        "high":  bars["high"].resample("W-FRI").max(),
+        "low":   bars["low"].resample("W-FRI").min(),
+        "close": bars["close"].resample("W-FRI").last(),
+    }).dropna()
+    wk_adx = adx(wk["high"], wk["low"], wk["close"], period)
+    return wk_adx.reindex(bars.index, method="ffill")
+
+
 # ── Per-Symbol Precompute ─────────────────────────────────────────────────────
 
 @dataclass
@@ -178,6 +194,7 @@ class PrecomputedSymbol:
     vol_ma:   np.ndarray
     w50_d:    np.ndarray
     w200_d:   np.ndarray
+    adx_w:    np.ndarray
     start_i:  int
     n:        int
 
@@ -190,6 +207,7 @@ def precompute_symbol(symbol: str, bars: pd.DataFrame) -> PrecomputedSymbol:
     atr14   = atr(bars["high"], bars["low"], close_s, config.ATR_PERIOD)
     vol_ma  = sma(bars["volume"], config.VOLUME_MA_PERIOD)
     w50_d, w200_d = weekly_smas_daily(bars)
+    adx_w   = weekly_adx_daily(bars, config.REGIME_ADX_PERIOD)
 
     w200_np = w200_d.to_numpy(dtype=float)
     n = len(bars)
@@ -214,6 +232,7 @@ def precompute_symbol(symbol: str, bars: pd.DataFrame) -> PrecomputedSymbol:
         vol_ma  = vol_ma.to_numpy(dtype=float),
         w50_d   = w50_d.to_numpy(dtype=float),
         w200_d  = w200_np,
+        adx_w   = adx_w.to_numpy(dtype=float),
         start_i = start_i,
         n       = n,
     )
@@ -258,6 +277,7 @@ def backtest_symbol(
     vol_ma  = data.vol_ma
     w50_d   = data.w50_d
     w200_d  = data.w200_d
+    adx_w   = data.adx_w
     dates   = data.dates
     n       = data.n
     start_i = data.start_i
@@ -347,8 +367,16 @@ def backtest_symbol(
                          and volume[i] > config.VOLUME_SPIKE_MULT * vol_ma[i])
             vol_ok = vol_spike if config.USE_VOLUME_FILTER else True
 
+            # Optional regime gate: weekly ADX must sit in the moderate-trend band.
+            if config.USE_REGIME_FILTER:
+                a = adx_w[i]
+                regime_ok = (not np.isnan(a)
+                             and config.REGIME_ADX_MIN <= a < config.REGIME_ADX_MAX)
+            else:
+                regime_ok = True
+
             if (weekly_ok and above_daily_sma and rsi_cross_above and vol_ok
-                    and not np.isnan(cur_atr)):
+                    and regime_ok and not np.isnan(cur_atr)):
                 # Enter at next bar's open — use next day's open if available
                 if i + 1 < n:
                     # Buy-side slippage: fill above the next open.

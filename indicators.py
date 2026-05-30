@@ -46,3 +46,44 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     ], axis=1).max(axis=1)
 
     return true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
+def efficiency_ratio(series: pd.Series, period: int = 10) -> pd.Series:
+    """
+    Kaufman Efficiency Ratio — how 'trending' vs 'choppy' price is, in [0, 1].
+
+    ER = |net change over N| / sum(|daily change|) over N.
+    Near 1 = a clean directional trend; near 0 = sideways/noisy chop.
+    Mean-reversion theory says we want LOW ER (range-bound) markets.
+    """
+    net_change = series.diff(period).abs()
+    volatility = series.diff().abs().rolling(window=period, min_periods=period).sum()
+    return net_change / volatility.replace(0, np.nan)
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Average Directional Index — trend STRENGTH (direction-agnostic), Wilder smoothing.
+
+    ADX < ~20  → no trend / range-bound (favorable for mean reversion)
+    ADX > ~25  → trending (unfavorable)
+    """
+    up_move   = high.diff()
+    down_move = -low.diff()
+    plus_dm   = ((up_move > down_move) & (up_move > 0)) * up_move.clip(lower=0)
+    minus_dm  = ((down_move > up_move) & (down_move > 0)) * down_move.clip(lower=0)
+
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    alpha    = 1 / period
+    atr_     = true_range.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
+    plus_di  = 100 * plus_dm.ewm(alpha=alpha, min_periods=period, adjust=False).mean()  / atr_
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, min_periods=period, adjust=False).mean() / atr_
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return dx.ewm(alpha=alpha, min_periods=period, adjust=False).mean()
