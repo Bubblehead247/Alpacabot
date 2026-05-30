@@ -48,6 +48,15 @@ RISK_PER_TRADE = 0.01        # 1% of account equity risked per trade
 ENTRY_LIMIT_PCT = 0.005      # Max we'll pay above prior close for a LOO buy (0.5%)
 EXIT_LIMIT_PCT  = 0.005      # Min we'll accept below prior close for a LOO sell (0.5%)
 
+# ── Backtest Slippage Model ───────────────────────────────────────────────────
+# Per-side slippage the BACKTESTER applies to model bid/ask spread + market
+# impact on market-on-open and stop fills. Buys fill SLIPPAGE_PCT above the
+# reference price, sells fill SLIPPAGE_PCT below it (a round trip costs ~2×).
+# 0.0005 = 5 bps/side. Alpaca is commission-free, so spread/impact is the
+# dominant friction. Set to 0.0 for a frictionless backtest.
+# NOTE: only consumed by backtest.py — does not affect live order placement.
+SLIPPAGE_PCT = 0.0005
+
 # ── Stop Loss Variants ────────────────────────────────────────────────────────
 # Both are tracked in logs. Only ACTIVE_STOP_MULT is actually executed.
 # Toggle between 1.5 and 2.5 to compare performance in paper trading.

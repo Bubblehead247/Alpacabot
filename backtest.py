@@ -261,6 +261,7 @@ def backtest_symbol(
     dates   = data.dates
     n       = data.n
     start_i = data.start_i
+    slip    = config.SLIPPAGE_PCT   # per-side: buys fill higher, sells fill lower
 
     equity        = initial_equity
     trades        = []
@@ -311,6 +312,9 @@ def backtest_symbol(
                 exit_reason = "rsi_exit"
 
             if exit_price is not None:
+                # Sell-side slippage: fill below the reference price. For a stop
+                # this also models gapping/slipping through the stop level.
+                exit_price *= (1 - slip)
                 pnl_dollars = (exit_price - entry_price) * shares
                 pnl_pct     = ((exit_price - entry_price) / entry_price) * 100
                 equity      += pnl_dollars
@@ -347,7 +351,8 @@ def backtest_symbol(
                     and not np.isnan(cur_atr)):
                 # Enter at next bar's open — use next day's open if available
                 if i + 1 < n:
-                    entry_price  = opens[i + 1]
+                    # Buy-side slippage: fill above the next open.
+                    entry_price  = opens[i + 1] * (1 + slip)
                     entry_date   = dates[i + 1].date()
                     entry_idx    = i + 1
                 else:
