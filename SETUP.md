@@ -138,9 +138,18 @@ Output files will appear in the same folder:
 
 ## Part 5: Run the Live Bot
 
+**Use Python 3.14.** The shared `quantcore` package is installed for 3.14 only,
+so launch the bot with the `py -3.14` selector — plain `python` may resolve to a
+different version (e.g. 3.13) that lacks `quantcore` and will crash on startup.
+Confirm first:
+
+```powershell
+py -3.14 -c "import quantcore, scanner; print('live import chain OK')"
+```
+
 ```powershell
 # Make sure you're in the bot directory with keys set, then:
-python main.py
+py -3.14 main.py
 ```
 
 The bot runs continuously. Logs go to both `bot.log` and the terminal.
@@ -148,7 +157,7 @@ The bot runs continuously. Logs go to both `bot.log` and the terminal.
 To run it in the background (so it keeps running after you close PowerShell):
 
 ```powershell
-Start-Process python -ArgumentList "main.py" -WindowStyle Hidden
+Start-Process py -ArgumentList "-3.14","main.py" -WindowStyle Hidden
 ```
 
 To see if it's running:
