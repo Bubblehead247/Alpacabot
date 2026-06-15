@@ -15,12 +15,15 @@ API_KEY    = os.getenv("ALPACA_API_KEY", "YOUR_KEY_HERE")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "YOUR_SECRET_HERE")
 PAPER      = True   # Set False when going live with real money
 
-# ── Trading Universe (Rulebook v1 — 16 ETFs) ──────────────────────────────────
+# ── Trading Universe (top 30 sideways picks from screener.py) ─────────────────
+# Replaces the original 16-ETF list. These are the highest-scoring range-bound
+# (low-trend) names from a full-universe screener run; see screener.py and
+# screener_results.csv. NOTE: the regime ADX filter below is OFF — these names
+# have low ADX and would be blocked by the 20–25 band.
 SYMBOLS = [
-    # Broad market
-    "SPY", "QQQ", "IWM", "DIA", "MDY",
-    # SPDR sector (XL family)
-    "XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLB", "XLRE", "XLK", "XLU",
+    "XLE", "XLI", "XBI", "SPGI", "EOG", "XOM", "CVX", "WBS", "V", "TT",
+    "OXY", "MA", "IJH", "XLY", "RSP", "BN", "TDG", "FANG", "COP", "EFA",
+    "AXP", "XLF", "LIN", "KVUE", "HWM", "IEFA", "XOP", "XRT", "DIS", "VGK",
 ]
 
 # ── Indicator Parameters ──────────────────────────────────────────────────────
@@ -72,7 +75,7 @@ ACTIVE_STOP_MULT = 2.5       # ← Change to 1.5 to test the tighter stop varian
 # scanner.py (live). Validation: filtered edge is positive in both in/out-of-
 # sample halves and ~3× lower drawdown, but keeps only ~26% of signals and its
 # bootstrap CI still includes zero — promising, not statistically proven.
-USE_REGIME_FILTER = True
+USE_REGIME_FILTER = False  # OFF: sideways universe (low ADX) would be blocked by the band
 REGIME_ADX_PERIOD = 14
 REGIME_ADX_MIN    = 20.0
 REGIME_ADX_MAX    = 25.0
