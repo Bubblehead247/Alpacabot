@@ -150,6 +150,12 @@ def evaluate_symbol(symbol: str) -> dict:
     active_stop = round(last_close - (config.ACTIVE_STOP_MULT * last_atr), 2)
 
     # ── Signal logic ──────────────────────────────────────────────────────────
+    # Trend filter: require an uptrend (price above weekly SMA50/200 and daily
+    # SMA50) to enter. When OFF (config.USE_TREND_FILTER), the strategy trades
+    # range-bound names with no trend requirement, so the weekly-SMA200
+    # structural exit is disabled too — otherwise it would dump sideways names
+    # that naturally sit below their 4-year average.
+    trend_ok           = (weekly_trend_ok and above_daily_sma50) if config.USE_TREND_FILTER else True
     # Volume spike is an optional confirmation (see config.USE_VOLUME_FILTER).
     volume_ok          = volume_spike if config.USE_VOLUME_FILTER else True
     # Regime gate: weekly ADX must sit in the moderate-trend band (see
@@ -157,9 +163,9 @@ def evaluate_symbol(symbol: str) -> dict:
     # 0.0 → fails the band, blocking entry (conservative — matches weekly gate).
     regime_ok          = (config.REGIME_ADX_MIN <= last_weekly_adx < config.REGIME_ADX_MAX
                           ) if config.USE_REGIME_FILTER else True
-    entry_signal       = weekly_trend_ok and above_daily_sma50 and rsi_crossed_above and volume_ok and regime_ok
+    entry_signal       = trend_ok and rsi_crossed_above and volume_ok and regime_ok
     exit_signal        = rsi_crossed_below
-    weekly_exit_signal = not above_weekly_sma200  # close below weekly SMA(200)
+    weekly_exit_signal = (not above_weekly_sma200) if config.USE_TREND_FILTER else False
 
     result = {
         "symbol":              symbol,

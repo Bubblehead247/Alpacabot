@@ -33,6 +33,11 @@ RSI_EXIT_THRESHOLD  = 70.0   # Exit fires when RSI(2) crosses back below this
 SMA_DAILY           = 50     # Daily SMA — price must be above this to enter
 SMA_WEEKLY_FAST     = 50     # Weekly SMA — trend gate (1-year)
 SMA_WEEKLY_SLOW     = 200    # Weekly SMA — trend gate (4-year)
+# Trend filter: when ON, entries require price above the daily SMA50 and weekly
+# SMA50/200, and positions exit on a close below the weekly SMA200. OFF for the
+# sideways universe — those low-trend names rarely sit above these averages, so
+# both the entry uptrend gate and the weekly-SMA200 exit are disabled.
+USE_TREND_FILTER    = False
 ATR_PERIOD          = 14
 VOLUME_MA_PERIOD    = 20     # Period for volume moving average
 VOLUME_SPIKE_MULT   = 1.5    # When the filter is ON: volume must exceed this × 20-day average
