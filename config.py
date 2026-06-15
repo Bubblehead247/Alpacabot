@@ -77,6 +77,24 @@ REGIME_ADX_PERIOD = 14
 REGIME_ADX_MIN    = 20.0
 REGIME_ADX_MAX    = 25.0
 
+# ── Sideways-Stock Screener (standalone — does NOT affect live trading) ───────
+# Used only by screener.py to scan all of Alpaca for range-bound (low-trend)
+# stocks and rank them by a combined "sideways score". None of these touch the
+# live bot, which trades only the SYMBOLS list above.
+SCREEN_MIN_PRICE         = 5.0          # Drop stocks priced below this
+SCREEN_MIN_DOLLAR_VOLUME = 20_000_000   # Liquidity floor: close × volume (1 day)
+SCREEN_LOOKBACK_DAYS     = 60           # Daily bars used for the sideways math
+SCREEN_ADX_PERIOD        = 14           # ADX period for the trendlessness score
+SCREEN_RANGE_SMA         = 50           # SMA the price must hug to count as range-bound
+SCREEN_RANGE_BAND_PCT    = 0.05         # ±5% band around the SMA = "near the mean"
+SCREEN_W_TREND           = 0.5          # Score weight: low ADX (trendlessness)
+SCREEN_W_RANGE           = 0.3          # Score weight: price hugs its mean
+SCREEN_W_LIQUIDITY       = 0.2          # Score weight: dollar volume
+SCREEN_TOP_N             = 50           # How many top candidates to report
+SCREEN_SNAPSHOT_CHUNK    = 1000         # Symbols per snapshot request (Stage 1)
+SCREEN_BARS_CHUNK        = 100          # Symbols per bars request (Stage 2)
+SCREEN_RESULTS_CSV       = "screener_results.csv"
+
 # ── ntfy.sh Push Alerts ───────────────────────────────────────────────────────
 NTFY_TOPIC = "MeansRevRSI"  # ntfy.sh topic — subscribe to this in the ntfy app
 

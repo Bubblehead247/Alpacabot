@@ -10,6 +10,7 @@ backtest_summary.csv
 sensitivity_results.csv
 robustness_buckets.csv
 regime_buckets.csv
+screener_results.csv
 _bars_cache.pkl
 positions.json
 .claude/
