@@ -427,9 +427,9 @@ def backtest_symbol(
 
     total_return = (equity - initial_equity) / initial_equity * 100
 
-    # CAGR — annualized from actual number of trading days simulated
-    n_bars  = n - start_i
-    n_years = n_bars / 252
+    # CAGR — calendar-time basis (days / 365.25), matching quantcore.metrics.cagr
+    # so the figure is comparable across every project's backtester.
+    n_years = (dates[-1] - dates[start_i]).days / 365.25 if start_i < n else 0
     cagr    = ((equity / initial_equity) ** (1 / n_years) - 1) * 100 if n_years > 0 and equity > 0 else 0
 
     avg_hold = sum(t.hold_days for t in trades) / len(trades) if trades else 0

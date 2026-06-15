@@ -8,3 +8,6 @@ requests>=2.31.0
 streamlit>=1.30.0
 streamlit-autorefresh>=1.0.0
 psutil>=5.9.0
+# Shared indicator/metric library — local editable package, not on PyPI.
+# Install from the sibling checkout: pip install -e ../quantcore
+quantcore>=0.1.0
