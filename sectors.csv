@@ -1,0 +1,31 @@
+symbol,sector,type
+SPGI,Financials,Stock
+EFA,Broad/Index,ETF
+MA,Financials,Stock
+LQD,Broad/Index,ETF
+XBI,Health Care,Sector ETF
+XLI,Industrials,Sector ETF
+IEFA,Broad/Index,ETF
+XLE,Energy,Sector ETF
+TDG,Industrials,Stock
+SCHW,Financials,Stock
+VGK,Broad/Index,ETF
+EMB,Broad/Index,ETF
+IDXX,Health Care,Stock
+DIS,Communication Services,Stock
+EOG,Energy,Stock
+AMGN,Health Care,Stock
+HYG,Broad/Index,ETF
+VCLT,Broad/Index,ETF
+TLT,Broad/Index,ETF
+V,Financials,Stock
+LIN,Materials,Stock
+CVX,Energy,Stock
+XOM,Energy,Stock
+EZU,Broad/Index,ETF
+FANG,Energy,Stock
+UBER,Technology,Stock
+XLP,Consumer Staples,Sector ETF
+MRK,Health Care,Stock
+ABNB,Consumer Discretionary,Stock
+BA,Industrials,Stock

@@ -22,6 +22,7 @@ import executor
 import notifier
 import position_tracker as pt
 import scanner
+import sectors
 import trade_log
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -114,14 +115,27 @@ def post_close_scan():
         # ── Entry ──
         if not in_position and result["entry_signal"]:
             queued_entries = sum(1 for p in _pending if p["action"] == "ENTRY")
+            # Per-sector cap: count this sector across open positions + queued entries.
+            cand_sector  = sectors.sector_of(symbol)
+            sector_count = sum(1 for s in open_positions if sectors.sector_of(s) == cand_sector)
+            sector_count += sum(1 for p in _pending if p["action"] == "ENTRY"
+                                and sectors.sector_of(p["symbol"]) == cand_sector)
+            if cand_sector == sectors.UNKNOWN:
+                logger.warning(f"  ⚠️  {symbol} has no sector mapping — re-run screener.py to refresh sectors.csv")
+
             if len(open_positions) + queued_entries >= config.MAX_POSITIONS:
                 logger.info(
                     f"  ⛔ Skipping ENTRY {symbol} — at max positions "
                     f"({len(open_positions)} open + {queued_entries} queued = {config.MAX_POSITIONS})"
                 )
+            elif sector_count >= config.MAX_PER_SECTOR:
+                logger.info(
+                    f"  ⛔ Skipping ENTRY {symbol} — sector '{cand_sector}' at cap "
+                    f"({sector_count}/{config.MAX_PER_SECTOR})"
+                )
             else:
                 _pending.append({"symbol": symbol, "action": "ENTRY", "scan_result": result})
-                logger.info(f"  📥 Queued ENTRY: {symbol}")
+                logger.info(f"  📥 Queued ENTRY: {symbol} | sector={cand_sector}")
                 notifier.send_signal(symbol, result["rsi2"])
         elif not in_position and result.get("rsi2", 100) <= 20:
             logger.info(f"  ⚠️  Warning zone: {symbol} RSI(2)={result['rsi2']:.1f}")

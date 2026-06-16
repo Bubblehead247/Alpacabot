@@ -36,6 +36,7 @@ from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass, AssetStatus
 
 import config
+import sectors
 from indicators import adx, sma
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -229,6 +230,13 @@ def run_screen(top_n: int) -> list[dict]:
     results.sort(key=lambda r: r["score"], reverse=True)
     top = results[:top_n]
 
+    # Tag the reported names with sector + asset type (yfinance for stocks),
+    # then persist the map so the live bot can enforce the per-sector cap.
+    logger.info(f"Classifying sectors for top {len(top)} names…")
+    for r in top:
+        r["sector"], r["type"] = sectors.classify(r["symbol"])
+    sectors.persist(top)
+
     _write_csv(top)
     _print_table(top)
     logger.info(f"Scored {len(results)} names; reported top {len(top)}.")
@@ -237,7 +245,7 @@ def run_screen(top_n: int) -> list[dict]:
 
 
 def _write_csv(rows: list[dict]) -> None:
-    headers = ["symbol", "score", "adx", "range_pct", "dollar_volume", "close"]
+    headers = ["symbol", "score", "adx", "range_pct", "dollar_volume", "close", "sector", "type"]
     with open(config.SCREEN_RESULTS_CSV, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
@@ -246,12 +254,13 @@ def _write_csv(rows: list[dict]) -> None:
 
 
 def _print_table(rows: list[dict]) -> None:
-    print(f"\n{'Symbol':<8}{'Score':>7}{'ADX':>7}{'Range%':>9}{'$Vol(M)':>11}{'Close':>10}")
-    print("-" * 52)
+    print(f"\n{'Symbol':<8}{'Score':>7}{'ADX':>7}{'Range%':>9}{'$Vol(M)':>11}{'Close':>10}  {'Sector':<22}{'Type'}")
+    print("-" * 88)
     for r in rows:
         print(
             f"{r['symbol']:<8}{r['score']:>7.1f}{r['adx']:>7.1f}"
-            f"{r['range_pct']:>9.1f}{r['dollar_volume'] / 1e6:>11.1f}{r['close']:>10.2f}"
+            f"{r['range_pct']:>9.1f}{r['dollar_volume'] / 1e6:>11.1f}{r['close']:>10.2f}  "
+            f"{r.get('sector', ''):<22}{r.get('type', '')}"
         )
     print()
 

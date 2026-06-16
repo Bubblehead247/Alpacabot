@@ -21,9 +21,9 @@ PAPER      = True   # Set False when going live with real money
 # screener_results.csv. NOTE: the regime ADX filter below is OFF — these names
 # have low ADX and would be blocked by the 20–25 band.
 SYMBOLS = [
-    "XLE", "XLI", "XBI", "SPGI", "EOG", "XOM", "CVX", "WBS", "V", "TT",
-    "OXY", "MA", "IJH", "XLY", "RSP", "BN", "TDG", "FANG", "COP", "EFA",
-    "AXP", "XLF", "LIN", "KVUE", "HWM", "IEFA", "XOP", "XRT", "DIS", "VGK",
+    "SPGI", "EFA", "MA", "LQD", "XBI", "XLI", "IEFA", "XLE", "TDG", "SCHW",
+    "VGK", "EMB", "IDXX", "DIS", "EOG", "AMGN", "HYG", "VCLT", "TLT", "V",
+    "LIN", "CVX", "XOM", "EZU", "FANG", "UBER", "XLP", "MRK", "ABNB", "BA",
 ]
 
 # ── Indicator Parameters ──────────────────────────────────────────────────────
@@ -109,6 +109,7 @@ NTFY_TOPIC = "MeansRevRSI"  # ntfy.sh topic — subscribe to this in the ntfy ap
 # ── Exit Rules ────────────────────────────────────────────────────────────────
 MAX_HOLD_DAYS = 7            # Time stop: force exit if trade is still open after 7 days
 MAX_POSITIONS = 5            # Max concurrent positions (5% total risk cap at 1% each)
+MAX_PER_SECTOR = 2           # Max concurrent positions in any one sector (see sectors.py)
 
 # ── Scheduling (Central Time — CST is ET minus 1 hour) ───────────────────────
 SCAN_TIME         = "15:30"  # Post-close scan       (4:30 PM ET)
