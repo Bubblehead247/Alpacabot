@@ -212,12 +212,14 @@ def precompute_symbol(symbol: str, bars: pd.DataFrame) -> PrecomputedSymbol:
     w200_np = w200_d.to_numpy(dtype=float)
     n = len(bars)
 
-    # Warmup: need enough bars for daily SMA50, ATR, volume MA, and a valid weekly SMA200.
+    # Warmup: need enough bars for daily SMA50, ATR, and volume MA.
     warmup  = max(config.SMA_DAILY, config.ATR_PERIOD, config.VOLUME_MA_PERIOD) + 5
     start_i = warmup
-    # Advance start until the weekly SMA200 series has warmed up too.
-    while start_i < n and np.isnan(w200_np[start_i]):
-        start_i += 1
+    # Only wait for the weekly SMA200 to warm up when a weekly gate is on —
+    # otherwise that ~4-year wait needlessly discards tradeable history.
+    if config.USE_TREND_FILTER or config.USE_REGIME_FILTER:
+        while start_i < n and np.isnan(w200_np[start_i]):
+            start_i += 1
 
     return PrecomputedSymbol(
         symbol  = symbol,
@@ -556,11 +558,13 @@ def run_backtest(
             logger.error(f"Failed to fetch {symbol}: {e}")
             continue
 
-        # Weekly SMA(200) needs ~200 weeks (~1000 trading days) just to warm up.
-        if len(bars) < 1050:
+        # Weekly SMA(200) needs ~200 weeks (~1050 trading days) to warm up — but
+        # only when a weekly gate is on. With the trend/regime gates off, a
+        # daily-SMA50 warmup (~120 bars) is plenty.
+        min_bars = 1050 if (config.USE_TREND_FILTER or config.USE_REGIME_FILTER) else 120
+        if len(bars) < min_bars:
             logger.warning(
-                f"{symbol}: Not enough history ({len(bars)} bars) for the weekly "
-                f"SMA(200) gate — needs ~1050. Skipping."
+                f"{symbol}: Not enough history ({len(bars)} bars) — needs ~{min_bars}. Skipping."
             )
             continue
 

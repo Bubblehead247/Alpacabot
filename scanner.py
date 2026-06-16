@@ -116,31 +116,35 @@ def evaluate_symbol(symbol: str) -> dict:
     volume_spike      = last_volume > (config.VOLUME_SPIKE_MULT * last_vol_ma20)
 
     # ── Weekly bars ───────────────────────────────────────────────────────────
+    # Only the trend gate and the regime gate use weekly data. When both are off
+    # the weekly fetch is pure cost, so skip it entirely (defaults below stand).
     above_weekly_sma50  = False
     above_weekly_sma200 = False
     last_weekly_sma50   = 0.0
     last_weekly_sma200  = 0.0
     last_weekly_adx     = 0.0
+    need_weekly = config.USE_TREND_FILTER or config.USE_REGIME_FILTER
 
-    try:
-        weekly_bars = fetch_weekly_bars(symbol)
-        if len(weekly_bars) >= config.SMA_WEEKLY_SLOW + 10:
-            w_close  = weekly_bars["close"]
-            w_sma50  = sma(w_close, config.SMA_WEEKLY_FAST)
-            w_sma200 = sma(w_close, config.SMA_WEEKLY_SLOW)
-            w_adx    = adx(weekly_bars["high"], weekly_bars["low"], w_close, config.REGIME_ADX_PERIOD)
-            last_weekly_sma50  = round(float(w_sma50.iloc[-1]),  2)
-            last_weekly_sma200 = round(float(w_sma200.iloc[-1]), 2)
-            last_weekly_adx    = round(float(w_adx.iloc[-1]),    2)
-            above_weekly_sma50  = last_close > last_weekly_sma50
-            above_weekly_sma200 = last_close > last_weekly_sma200
-        else:
-            logger.warning(
-                f"{symbol}: Insufficient weekly data ({len(weekly_bars)} bars) "
-                f"— weekly gate FAILED (need {config.SMA_WEEKLY_SLOW + 10})."
-            )
-    except Exception as e:
-        logger.error(f"{symbol}: Weekly bar fetch failed: {e}", exc_info=True)
+    if need_weekly:
+        try:
+            weekly_bars = fetch_weekly_bars(symbol)
+            if len(weekly_bars) >= config.SMA_WEEKLY_SLOW + 10:
+                w_close  = weekly_bars["close"]
+                w_sma50  = sma(w_close, config.SMA_WEEKLY_FAST)
+                w_sma200 = sma(w_close, config.SMA_WEEKLY_SLOW)
+                w_adx    = adx(weekly_bars["high"], weekly_bars["low"], w_close, config.REGIME_ADX_PERIOD)
+                last_weekly_sma50  = round(float(w_sma50.iloc[-1]),  2)
+                last_weekly_sma200 = round(float(w_sma200.iloc[-1]), 2)
+                last_weekly_adx    = round(float(w_adx.iloc[-1]),    2)
+                above_weekly_sma50  = last_close > last_weekly_sma50
+                above_weekly_sma200 = last_close > last_weekly_sma200
+            else:
+                logger.warning(
+                    f"{symbol}: Insufficient weekly data ({len(weekly_bars)} bars) "
+                    f"— weekly gate FAILED (need {config.SMA_WEEKLY_SLOW + 10})."
+                )
+        except Exception as e:
+            logger.error(f"{symbol}: Weekly bar fetch failed: {e}", exc_info=True)
 
     weekly_trend_ok = above_weekly_sma50 and above_weekly_sma200
 
