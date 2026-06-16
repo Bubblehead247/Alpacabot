@@ -320,8 +320,10 @@ def backtest_symbol(
                 exit_price  = day_open     # Exit at open on day 7
                 exit_reason = "time_stop"
 
-            # Priority 3: Weekly trend break — prior close below weekly SMA(200)
-            elif cur_w200 is not None and close[i - 1] < w200_d[i - 1]:
+            # Priority 3: Weekly trend break — prior close below weekly SMA(200).
+            # Disabled with the trend filter (see config.USE_TREND_FILTER).
+            elif (config.USE_TREND_FILTER and cur_w200 is not None
+                  and close[i - 1] < w200_d[i - 1]):
                 exit_price  = day_open
                 exit_reason = "weekly_exit"
 
@@ -375,7 +377,11 @@ def backtest_symbol(
             else:
                 regime_ok = True
 
-            if (weekly_ok and above_daily_sma and rsi_cross_above and vol_ok
+            # Trend gate (weekly SMA50/200 + daily SMA50) is optional — see
+            # config.USE_TREND_FILTER. OFF for the sideways universe.
+            trend_ok = (weekly_ok and above_daily_sma) if config.USE_TREND_FILTER else True
+
+            if (trend_ok and rsi_cross_above and vol_ok
                     and regime_ok and not np.isnan(cur_atr)):
                 # Enter at next bar's open — use next day's open if available
                 if i + 1 < n:
