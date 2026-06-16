@@ -7,6 +7,9 @@ __pycache__/
 *.zip
 backtest_trades.csv
 backtest_summary.csv
+backtest_portfolio_trades.csv
+backtest_portfolio_summary.csv
+backtest_portfolio_by_symbol.csv
 sensitivity_results.csv
 robustness_buckets.csv
 regime_buckets.csv
