@@ -51,6 +51,11 @@ WEEKLY_LOOKBACK_WEEKS = 220  # Weekly bars (SMA200=200 + buffer)
 
 # ── Risk Management ───────────────────────────────────────────────────────────
 RISK_PER_TRADE = 0.01        # 1% of account equity risked per trade
+# Notional cap: no single position may exceed this fraction of equity. Stops the
+# 1%-risk sizing formula from building huge, leveraged positions on low-vol names
+# (tiny stop distance → giant share count). At 0.20, MAX_POSITIONS(5) × 20% =
+# 100% of equity fully invested with no leverage.
+MAX_POSITION_PCT = 0.20
 
 # ── Limit Order Slippage Controls ─────────────────────────────────────────────
 ENTRY_LIMIT_PCT = 0.005      # Max we'll pay above prior close for a LOO buy (0.5%)

@@ -48,6 +48,17 @@ def calculate_position_size(
     raw_shares  = dollar_risk / stop_distance
     shares      = math.floor(raw_shares)   # Always floor — never risk more than 1%
 
+    # Notional cap: never let one position exceed MAX_POSITION_PCT of equity.
+    # On low-volatility names the stop distance is tiny, so the risk formula would
+    # otherwise size a position far larger than the account (leverage).
+    max_shares_notional = math.floor((account_equity * config.MAX_POSITION_PCT) / entry_price)
+    if shares > max_shares_notional:
+        logger.info(
+            f"Notional cap applied: {shares} → {max_shares_notional} shares "
+            f"(>{config.MAX_POSITION_PCT:.0%} of equity at ${entry_price:.2f})"
+        )
+        shares = max_shares_notional
+
     if shares <= 0:
         logger.warning(
             f"Position size calculated as 0. "

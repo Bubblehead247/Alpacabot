@@ -3,28 +3,27 @@ backtest_portfolio.py — Portfolio-level backtest with shared capital + caps.
 
 Unlike backtest.py (which runs each symbol in its own $100k sandbox), this
 shares ONE equity pool across config.SYMBOLS and enforces the live risk caps:
-  - config.MAX_POSITIONS   total open positions
-  - config.MAX_PER_SECTOR  open positions per sector (see sectors.py)
+  - config.MAX_POSITIONS    total open positions
+  - config.MAX_PER_SECTOR   open positions per sector (see sectors.py)
+  - config.MAX_POSITION_PCT notional cap per position (no leverage)
 
-So it answers the real question: "what would the *account* have done?" — and it
-is the only backtest that actually exercises the per-sector cap.
+So it answers the real question: "what would the *account* have done?"
 
-Strategy modelled = the current daily mean-reversion config:
-  Entry : RSI(2) crosses back ABOVE RSI_ENTRY_THRESHOLD (prev<=10, now>10),
-          plus the daily SMA50 gate only when config.USE_TREND_FILTER is on.
-  Exits : hard stop (ATR) > time stop (MAX_HOLD_DAYS) > RSI(2) crossback below
-          RSI_EXIT_THRESHOLD.
-Each bar: yesterday's signals fill at today's open; the most oversold names win
-scarce slots. Slippage (config.SLIPPAGE_PCT) is applied per side.
+Stop modes (compared side by side by default):
+  ATR   : fixed hard stop at entry − mult × ATR(14)         (the live stop)
+  Trail : trailing stop at peak_high × (1 − pct), ratcheting up only
+Both modes keep the other exits unchanged (time stop, RSI(2) crossback below 70).
 
-NOTE: this engine is daily-only. The weekly trend/regime gates are not modelled,
-so if USE_TREND_FILTER or USE_REGIME_FILTER is on it warns that results are
-approximate (use backtest.py for the weekly-gated strategy).
+Entry = current daily config: RSI(2) crosses back ABOVE RSI_ENTRY_THRESHOLD,
+plus the daily SMA50 gate only when config.USE_TREND_FILTER is on. Each bar,
+yesterday's signals fill at today's open; most oversold names win scarce slots.
+Per-side slippage (config.SLIPPAGE_PCT) applied. CAGR is calendar-basis.
+
+NOTE: daily-only engine — the weekly trend/regime gates are not modelled.
 
 Usage:
-    python backtest_portfolio.py                 # both stop variants, 12yr
+    python backtest_portfolio.py                 # ATR 1.5/2.5 + trail 1/2/5%
     python backtest_portfolio.py --years 8
-    python backtest_portfolio.py --stop-mult 2.5 # single variant
 
 Output (gitignored):
     backtest_portfolio_trades.csv
@@ -59,6 +58,8 @@ class _Pos:
     stop_price:  float
     entry_bar:   int
     shares:      int
+    peak:        float        # highest high since entry (for trailing stops)
+    trail_pct:   float        # 0.0 for a fixed ATR stop
 
 
 @dataclass
@@ -119,16 +120,18 @@ def _build_indicators(opens, highs, lows, closes, symbols):
 
 # ── Portfolio engine ──────────────────────────────────────────────────────────
 
-def run(symbols, stop_mult, max_positions, max_per_sector, years, initial_equity):
-    variant = f"{stop_mult}x"
+def run(symbols, stop_kind, stop_param, variant, max_positions, max_per_sector,
+        years, initial_equity):
+    """stop_kind: 'atr' (stop_param = ATR multiple) or 'trail' (stop_param = pct)."""
     slip = config.SLIPPAGE_PCT
-    logger.info(f"\nPortfolio backtest | Stop {variant} ATR | MaxPos {max_positions} | "
-                f"MaxPerSector {max_per_sector}")
+    logger.info(f"\nPortfolio backtest | {variant} | MaxPos {max_positions} | "
+                f"MaxPerSector {max_per_sector} | NotionalCap {config.MAX_POSITION_PCT:.0%}")
 
     opens, highs, lows, closes = _load_data(symbols, years)
     sma50, rsi2, atr14, tradeable = _build_indicators(opens, highs, lows, closes, symbols)
 
     o_arr = {s: opens[s].reindex(closes.index).values  for s in tradeable}
+    h_arr = {s: highs[s].reindex(closes.index).values  for s in tradeable}
     l_arr = {s: lows[s].reindex(closes.index).values   for s in tradeable}
     c_arr = {s: closes[s].reindex(closes.index).values for s in tradeable}
     sec_of = {s: sectors.sector_of(s) for s in tradeable}
@@ -138,44 +141,50 @@ def run(symbols, stop_mult, max_positions, max_per_sector, years, initial_equity
     equity     = initial_equity
     peak_eq    = initial_equity
     max_dd     = 0.0
-    eq_curve: list[float]     = []
+    eq_curve: list[float]      = []
     positions: dict[str, _Pos] = {}
-    pending: list[tuple]       = []   # (symbol, signal_rsi, signal_atr) from prior close
+    pending: list[tuple]       = []   # (symbol, signal_rsi, signal_atr)
     all_trades: list[Trade]    = []
-
-    start_bar = config.SMA_DAILY + 5
+    start_bar  = config.SMA_DAILY + 5
 
     def sector_load(sec, extra):
-        held = sum(1 for p in positions.values() if p.sector == sec)
-        return held + extra.get(sec, 0)
+        return sum(1 for p in positions.values() if p.sector == sec) + extra.get(sec, 0)
 
     for i in range(start_bar, n):
         date_str = str(dates[i].date())
 
         # 1. Execute yesterday's pending entries at today's open (most oversold first)
         if pending:
-            added_in_sector: dict[str, int] = defaultdict(int)
+            added: dict[str, int] = defaultdict(int)
             for sym, sig_rsi, sig_atr in sorted(pending, key=lambda x: x[1]):
                 if len(positions) >= max_positions:
                     break
                 if sym in positions:
                     continue
                 sec = sec_of[sym]
-                if sector_load(sec, added_in_sector) >= max_per_sector:
+                if sector_load(sec, added) >= max_per_sector:
                     continue
                 open_px = o_arr[sym][i]
-                if np.isnan(open_px) or open_px <= 0 or np.isnan(sig_atr):
+                if np.isnan(open_px) or open_px <= 0:
                     continue
-                entry_px  = open_px * (1 + slip)          # buy-side slippage
-                stop_px   = entry_px - stop_mult * sig_atr
-                stop_dist = entry_px - stop_px
+                entry_px = open_px * (1 + slip)
+                if stop_kind == "atr":
+                    if np.isnan(sig_atr):
+                        continue
+                    stop_dist = stop_param * sig_atr
+                else:  # trail
+                    stop_dist = entry_px * stop_param
+                stop_px = entry_px - stop_dist
                 if stop_dist <= 0:
                     continue
                 shares = int(equity * config.RISK_PER_TRADE / stop_dist)
+                shares = min(shares, int(equity * config.MAX_POSITION_PCT / entry_px))  # notional cap
                 if shares <= 0:
                     continue
-                positions[sym] = _Pos(sym, sec, date_str, entry_px, stop_px, i, shares)
-                added_in_sector[sec] += 1
+                positions[sym] = _Pos(sym, sec, date_str, entry_px, stop_px, i, shares,
+                                      peak=entry_px,
+                                      trail_pct=stop_param if stop_kind == "trail" else 0.0)
+                added[sec] += 1
         pending = []
 
         # 2. Check exits for open positions
@@ -183,14 +192,17 @@ def run(symbols, stop_mult, max_positions, max_per_sector, years, initial_equity
             pos       = positions[sym]
             days_held = i - pos.entry_bar
             low_px    = l_arr[sym][i]
+            high_px   = h_arr[sym][i]
             open_px   = o_arr[sym][i]
             prev_rsi  = rsi2[sym][i - 1]
             prev2_rsi = rsi2[sym][i - 2]
             if np.isnan(low_px) or np.isnan(open_px):
                 continue
 
+            # The stop level for this bar reflects highs through the PRIOR bar
+            # (set at the end of the last iteration) — no same-bar lookahead.
             exit_px = exit_reason = None
-            if low_px <= pos.stop_price:                                  # hard stop
+            if low_px <= pos.stop_price:                                  # hard / trailing stop
                 exit_px, exit_reason = pos.stop_price, "stop_loss"
             elif days_held >= config.MAX_HOLD_DAYS:                       # time stop
                 exit_px, exit_reason = open_px, "time_stop"
@@ -200,7 +212,7 @@ def run(symbols, stop_mult, max_positions, max_per_sector, years, initial_equity
                 exit_px, exit_reason = open_px, "rsi_exit"
 
             if exit_px is not None:
-                exit_px *= (1 - slip)                                     # sell-side slippage
+                exit_px *= (1 - slip)
                 pnl_d = (exit_px - pos.entry_price) * pos.shares
                 pnl_p = (exit_px - pos.entry_price) / pos.entry_price * 100
                 equity += pnl_d
@@ -212,6 +224,10 @@ def run(symbols, stop_mult, max_positions, max_per_sector, years, initial_equity
                     pnl_dollars=round(pnl_d, 2), pnl_pct=round(pnl_p, 2), hold_days=days_held,
                 ))
                 del positions[sym]
+            elif pos.trail_pct and not np.isnan(high_px):
+                # Survived the bar — ratchet the trailing stop up for the NEXT bar.
+                pos.peak = max(pos.peak, high_px)
+                pos.stop_price = max(pos.stop_price, pos.peak * (1 - pos.trail_pct))
 
         # 3. Scan for new entry signals (RSI crossback above 10), fill at next open
         if len(positions) < max_positions:
@@ -236,45 +252,27 @@ def run(symbols, stop_mult, max_positions, max_per_sector, years, initial_equity
         peak_eq = max(peak_eq, mtm)
         max_dd  = max(max_dd, (peak_eq - mtm) / peak_eq * 100)
 
-    summary = _summarize(all_trades, eq_curve, equity, initial_equity, dates, start_bar,
-                         variant, max_positions, max_per_sector, max_dd)
-    return all_trades, summary
+    return all_trades, _summarize(all_trades, eq_curve, equity, initial_equity,
+                                  dates, start_bar, variant, max_dd)
 
 
 # ── Stats + reporting ─────────────────────────────────────────────────────────
 
-def _summarize(trades, eq_curve, equity, init_eq, dates, start_bar,
-               variant, max_positions, max_per_sector, max_dd):
+def _summarize(trades, eq_curve, equity, init_eq, dates, start_bar, variant, max_dd):
     winners = [t for t in trades if t.pnl_dollars > 0]
     losers  = [t for t in trades if t.pnl_dollars <= 0]
     win_rate = len(winners) / len(trades) * 100 if trades else 0
     avg_win  = sum(t.pnl_pct for t in winners) / len(winners) if winners else 0
     avg_loss = sum(t.pnl_pct for t in losers)  / len(losers)  if losers  else 0
-    gw = sum(t.pnl_dollars for t in winners)
-    gl = abs(sum(t.pnl_dollars for t in losers))
+    gw = sum(t.pnl_dollars for t in winners); gl = abs(sum(t.pnl_dollars for t in losers))
     pf = gw / gl if gl > 0 else float("inf")
     tot_ret = (equity - init_eq) / init_eq * 100
-    # CAGR — calendar basis (days/365.25) to match the rest of the project.
     n_years = (dates[-1] - dates[start_bar]).days / 365.25
     cagr = ((equity / init_eq) ** (1 / n_years) - 1) * 100 if n_years > 0 and equity > 0 else 0
     avg_hold = sum(t.hold_days for t in trades) / len(trades) if trades else 0
     ex = {r: sum(1 for t in trades if t.exit_reason == r) for r in ("rsi_exit", "stop_loss", "time_stop")}
-
-    W = 66
-    print(f"\n{'='*W}")
-    print(f"  PORTFOLIO  |  Stop {variant} ATR  |  MaxPos {max_positions}  |  MaxPerSector {max_per_sector}")
-    print(f"  {dates[start_bar].date()} → {dates[-1].date()}")
-    print(f"{'='*W}")
-    print(f"  Equity:       ${init_eq:>12,.2f}  →  ${equity:>12,.2f}")
-    print(f"  Total Return: {tot_ret:>+.1f}%   |   CAGR: {cagr:>+.2f}%   |   Max DD: {max_dd:.1f}%")
-    print(f"{'─'*W}")
-    print(f"  Trades: {len(trades):,}  |  Win Rate: {win_rate:.1f}%  |  PF: {pf:.2f}  |  Avg Hold: {avg_hold:.1f}d")
-    print(f"  Avg Win: +{avg_win:.2f}%   Avg Loss: {avg_loss:.2f}%")
-    print(f"  Exits — RSI: {ex['rsi_exit']:,}  Stop: {ex['stop_loss']:,}  Time: {ex['time_stop']:,}")
-    print(f"{'='*W}\n")
-
     return {
-        "stop_variant": variant, "total_trades": len(trades),
+        "variant": variant, "total_trades": len(trades),
         "win_rate_pct": round(win_rate, 1), "avg_win_pct": round(avg_win, 2),
         "avg_loss_pct": round(avg_loss, 2), "profit_factor": round(pf, 2),
         "cagr_pct": round(cagr, 2), "total_return_pct": round(tot_ret, 2),
@@ -311,6 +309,18 @@ def _save(rows, filename):
     logger.info(f"Saved → {filename} ({len(rows):,} rows)")
 
 
+def _print_comparison(summaries):
+    print(f"\n{'='*86}\n  STOP-METHOD COMPARISON  ({config.MAX_POSITIONS} pos / {config.MAX_PER_SECTOR} "
+          f"per sector / {config.MAX_POSITION_PCT:.0%} notional cap)\n{'='*86}")
+    print(f"  {'Variant':<12}{'Return':>9}{'CAGR':>8}{'MaxDD':>8}{'Win%':>7}{'PF':>6}{'Trades':>8}{'Hold':>6}")
+    print("  " + "-" * 82)
+    for s in summaries:
+        print(f"  {s['variant']:<12}{s['total_return_pct']:>+8.1f}%{s['cagr_pct']:>+7.2f}%"
+              f"{s['max_drawdown_pct']:>7.1f}%{s['win_rate_pct']:>7.1f}{s['profit_factor']:>6.2f}"
+              f"{s['total_trades']:>8,}{s['avg_hold_days']:>6.1f}")
+    print(f"{'='*86}\n")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -319,26 +329,31 @@ if __name__ == "__main__":
     parser.add_argument("--max-positions",  type=int,   default=config.MAX_POSITIONS)
     parser.add_argument("--max-per-sector", type=int,   default=config.MAX_PER_SECTOR)
     parser.add_argument("--equity",         type=float, default=100_000.0)
-    parser.add_argument("--stop-mult",      type=float, default=None,
-                        help="Single stop multiplier. Default: test both 1.5× and 2.5×.")
     args = parser.parse_args()
 
     if config.USE_TREND_FILTER or config.USE_REGIME_FILTER:
-        logger.warning("USE_TREND_FILTER/USE_REGIME_FILTER is ON — this daily-only engine "
-                       "does not model the weekly gates; results are approximate. "
-                       "Use backtest.py for the weekly-gated strategy.")
+        logger.warning("Weekly gate is ON — daily-only engine; results approximate. Use backtest.py.")
 
-    mults = [args.stop_mult] if args.stop_mult else [config.STOP_MULT_A, config.STOP_MULT_B]
+    # (stop_kind, stop_param, label)
+    VARIANTS = [
+        ("atr",   config.STOP_MULT_A, f"ATR-{config.STOP_MULT_A}x"),
+        ("atr",   config.STOP_MULT_B, f"ATR-{config.STOP_MULT_B}x"),
+        ("trail", 0.01,               "Trail-1%"),
+        ("trail", 0.02,               "Trail-2%"),
+        ("trail", 0.05,               "Trail-5%"),
+    ]
+
     all_trades, all_summaries = [], []
-    for mult in mults:
+    for kind, param, label in VARIANTS:
         trades, summary = run(
-            symbols=config.SYMBOLS, stop_mult=mult,
+            symbols=config.SYMBOLS, stop_kind=kind, stop_param=param, variant=label,
             max_positions=args.max_positions, max_per_sector=args.max_per_sector,
             years=args.years, initial_equity=args.equity,
         )
         all_trades.extend(trades)
         all_summaries.append(summary)
 
+    _print_comparison(all_summaries)
     _save(all_trades,                   "backtest_portfolio_trades.csv")
     _save(all_summaries,                "backtest_portfolio_summary.csv")
     _save(per_symbol_stats(all_trades), "backtest_portfolio_by_symbol.csv")

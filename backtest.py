@@ -403,6 +403,9 @@ def backtest_symbol(
                 dollar_risk  = equity * config.RISK_PER_TRADE
                 shares       = int(dollar_risk / stop_dist)
 
+                # Notional cap: never exceed MAX_POSITION_PCT of equity per position.
+                shares = min(shares, int(equity * config.MAX_POSITION_PCT / entry_price))
+
                 if shares <= 0:
                     continue
 
