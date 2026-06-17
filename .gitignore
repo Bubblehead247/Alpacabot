@@ -19,3 +19,4 @@ screener_results.csv
 _bars_cache.pkl
 positions.json
 .claude/
+backtest_wf_sweep.csv

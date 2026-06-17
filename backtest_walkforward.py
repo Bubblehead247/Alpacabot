@@ -167,29 +167,30 @@ def _sideways_score(prep, s, r):
     return score, adxv
 
 
-def _active_sets(prep, lo, hi):
+def _active_sets(prep, lo, hi, rebal_days, top_k):
     """Build {rebalance_bar: set(active symbols)} over [lo, hi)."""
     out = {}
-    for r in range(lo, hi, REBAL_DAYS):
+    for r in range(lo, hi, rebal_days):
         scored = []
         for s in prep["tradeable"]:
             res = _sideways_score(prep, s, r)
             if res is not None:
                 scored.append((s, res[0]))
         scored.sort(key=lambda x: -x[1])
-        out[r] = {s for s, _ in scored[:ACTIVE_TOP_K]}
+        out[r] = {s for s, _ in scored[:top_k]}
     return out
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
 
-def run_engine(prep, lo, hi, variant, initial_equity):
+def run_engine(prep, lo, hi, variant, initial_equity,
+               rebal_days=REBAL_DAYS, top_k=ACTIVE_TOP_K):
     slip = config.SLIPPAGE_PCT
     o,h,l,c = prep["o"],prep["h"],prep["l"],prep["c"]
     rsi2,sma50,atr14,adx14 = prep["rsi2"],prep["sma50"],prep["atr14"],prep["adx14"]
     dates,tradeable = prep["dates"],prep["tradeable"]
 
-    active_sets = _active_sets(prep, lo, hi)
+    active_sets = _active_sets(prep, lo, hi, rebal_days, top_k)
     rebal_bars  = sorted(active_sets)
 
     equity = peak_eq = initial_equity
@@ -306,29 +307,60 @@ def _print(label, s):
           f"{s['pct_entries_adx_below_25']:>8.0f}%")
 
 
+def sweep(prep, equity):
+    """Grid over top-K and rebalance frequency. Reports full + OOS PF/CAGR/DD."""
+    n=prep["n"]; mid=(WF_START+n)//2
+    KS=[10,20,30,50]; REBALS=[("weekly",5),("monthly",21),("quarterly",63)]
+    print(f"\n{'='*100}\n  SENSITIVITY SWEEP — top-K × rebalance  (ATR-{STOP_MULT}x, "
+          f"{config.MAX_POSITIONS}pos/{config.MAX_PER_SECTOR}sector)\n{'='*100}")
+    print(f"  {'Rebalance':<11}{'TopK':>5}{'FullPF':>9}{'FullCAGR':>10}{'FullDD':>8}"
+          f"{'OOS_PF':>9}{'OOS_CAGR':>10}{'Trades':>8}")
+    print("  "+"-"*96)
+    rows=[]
+    for label,rd in REBALS:
+        for k in KS:
+            _,sf=run_engine(prep,WF_START,n,"full",equity,rebal_days=rd,top_k=k)
+            _,so=run_engine(prep,mid,n,"oos",equity,rebal_days=rd,top_k=k)
+            print(f"  {label:<11}{k:>5}{sf['profit_factor']:>9.2f}{sf['cagr_pct']:>+9.2f}%"
+                  f"{sf['max_drawdown_pct']:>7.1f}%{so['profit_factor']:>9.2f}"
+                  f"{so['cagr_pct']:>+9.2f}%{sf['total_trades']:>8,}")
+            rows.append({"rebalance":label,"rebal_days":rd,"top_k":k,
+                         "full_pf":sf['profit_factor'],"full_cagr":sf['cagr_pct'],
+                         "full_dd":sf['max_drawdown_pct'],"oos_pf":so['profit_factor'],
+                         "oos_cagr":so['cagr_pct'],"full_trades":sf['total_trades']})
+    print(f"{'='*100}\n")
+    return rows
+
+
 if __name__ == "__main__":
     ap=argparse.ArgumentParser(description="Walk-forward point-in-time screening backtest")
     ap.add_argument("--years",type=int,default=12)
     ap.add_argument("--equity",type=float,default=100_000.0)
+    ap.add_argument("--sweep",action="store_true",help="Sweep top-K × rebalance frequency.")
     args=ap.parse_args()
 
     if config.USE_TREND_FILTER or config.USE_REGIME_FILTER:
         logger.warning("Weekly gate ON — daily-only engine; results approximate.")
 
     prep=prepare(args.years)
-    n=prep["n"]; mid=(WF_START+n)//2
-    print(f"\n{'='*104}\n  WALK-FORWARD (point-in-time screen, top {ACTIVE_TOP_K}, monthly) | "
-          f"ATR-{STOP_MULT}x | {config.MAX_POSITIONS}pos/{config.MAX_PER_SECTOR}sector/"
-          f"{config.MAX_POSITION_PCT:.0%}cap\n{'='*104}")
-    print(f"  {'Period':<10}{'Window':<24}{'Return':>9}{'CAGR':>7}{'MaxDD':>8}{'Win%':>7}"
-          f"{'PF':>6}{'Trades':>7}{'EntryADX':>9}{'<25':>8}")
-    print("  "+"-"*100)
-    t_full,s_full=run_engine(prep,WF_START,n,"Full",args.equity)
-    t_is,s_is=run_engine(prep,WF_START,mid,"In-sample",args.equity)
-    t_oos,s_oos=run_engine(prep,mid,n,"Out-sample",args.equity)
-    _print("Full",s_full); _print("In-samp",s_is); _print("Out-samp",s_oos)
-    print(f"{'='*104}\n")
 
-    _save(t_full,"backtest_wf_trades.csv")
-    _save([s_full,s_is,s_oos],"backtest_wf_summary.csv")
-    print("✅ Done. → backtest_wf_{trades,summary}.csv")
+    if args.sweep:
+        rows=sweep(prep,args.equity)
+        _save(rows,"backtest_wf_sweep.csv")
+        print("✅ Done. → backtest_wf_sweep.csv")
+    else:
+        n=prep["n"]; mid=(WF_START+n)//2
+        print(f"\n{'='*104}\n  WALK-FORWARD (point-in-time screen, top {ACTIVE_TOP_K}, monthly) | "
+              f"ATR-{STOP_MULT}x | {config.MAX_POSITIONS}pos/{config.MAX_PER_SECTOR}sector/"
+              f"{config.MAX_POSITION_PCT:.0%}cap\n{'='*104}")
+        print(f"  {'Period':<10}{'Window':<24}{'Return':>9}{'CAGR':>7}{'MaxDD':>8}{'Win%':>7}"
+              f"{'PF':>6}{'Trades':>7}{'EntryADX':>9}{'<25':>8}")
+        print("  "+"-"*100)
+        t_full,s_full=run_engine(prep,WF_START,n,"Full",args.equity)
+        t_is,s_is=run_engine(prep,WF_START,mid,"In-sample",args.equity)
+        t_oos,s_oos=run_engine(prep,mid,n,"Out-sample",args.equity)
+        _print("Full",s_full); _print("In-samp",s_is); _print("Out-samp",s_oos)
+        print(f"{'='*104}\n")
+        _save(t_full,"backtest_wf_trades.csv")
+        _save([s_full,s_is,s_oos],"backtest_wf_summary.csv")
+        print("✅ Done. → backtest_wf_{trades,summary}.csv")
