@@ -10,6 +10,8 @@ backtest_summary.csv
 backtest_portfolio_trades.csv
 backtest_portfolio_summary.csv
 backtest_portfolio_by_symbol.csv
+backtest_wf_trades.csv
+backtest_wf_summary.csv
 sensitivity_results.csv
 robustness_buckets.csv
 regime_buckets.csv
