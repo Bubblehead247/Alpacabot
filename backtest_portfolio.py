@@ -1,34 +1,34 @@
 """
 backtest_portfolio.py — Portfolio-level backtest with shared capital + caps.
 
-Unlike backtest.py (which runs each symbol in its own $100k sandbox), this
-shares ONE equity pool across config.SYMBOLS and enforces the live risk caps:
+Unlike backtest.py (each symbol in its own $100k sandbox), this shares ONE
+equity pool across config.SYMBOLS and enforces the live risk caps:
   - config.MAX_POSITIONS    total open positions
-  - config.MAX_PER_SECTOR   open positions per sector (see sectors.py)
+  - config.MAX_PER_SECTOR   open positions per sector (sectors.py)
   - config.MAX_POSITION_PCT notional cap per position (no leverage)
 
-So it answers the real question: "what would the *account* have done?"
+Stop modes:
+  ATR   : fixed hard stop at entry − mult × ATR(14)       (the live stop)
+  Trail : trailing stop at peak_high × (1 − pct), ratchets up only
 
-Stop modes (compared side by side by default):
-  ATR   : fixed hard stop at entry − mult × ATR(14)         (the live stop)
-  Trail : trailing stop at peak_high × (1 − pct), ratcheting up only
-Both modes keep the other exits unchanged (time stop, RSI(2) crossback below 70).
-
-Entry = current daily config: RSI(2) crosses back ABOVE RSI_ENTRY_THRESHOLD,
+Entry  = current daily config: RSI(2) crosses back ABOVE RSI_ENTRY_THRESHOLD,
 plus the daily SMA50 gate only when config.USE_TREND_FILTER is on. Each bar,
 yesterday's signals fill at today's open; most oversold names win scarce slots.
-Per-side slippage (config.SLIPPAGE_PCT) applied. CAGR is calendar-basis.
 
-NOTE: daily-only engine — the weekly trend/regime gates are not modelled.
+No-lookahead guarantees (audited):
+  - Entry signals are read at close[i] and filled at open[i+1].
+  - A trailing stop is ratcheted with high[i] only AFTER the bar's exit check,
+    so the stop tested on bar i reflects highs through i−1 only.
+  - RSI exit uses rsi[i−1]/rsi[i−2] and fills at open[i]; ATR sizing uses the
+    signal bar's atr. All indicators are causal (rolling).
+  - Stops fill at the stop level, or at the OPEN if the bar gapped through it
+    (no optimistic gap fills).
 
-Usage:
-    python backtest_portfolio.py                 # ATR 1.5/2.5 + trail 1/2/5%
-    python backtest_portfolio.py --years 8
+Modes:
+  python backtest_portfolio.py             # out-of-sample validation (default)
+  python backtest_portfolio.py --compare   # single-period, all stop variants
 
-Output (gitignored):
-    backtest_portfolio_trades.csv
-    backtest_portfolio_summary.csv
-    backtest_portfolio_by_symbol.csv
+Output (gitignored): backtest_portfolio_{trades,summary,by_symbol}.csv
 """
 import argparse
 import csv
@@ -48,6 +48,8 @@ from indicators import sma, rsi, atr
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger(__name__)
 
+START_BAR = config.SMA_DAILY + 5   # warmup for daily SMA50 / ATR / RSI
+
 
 @dataclass
 class _Pos:
@@ -58,7 +60,7 @@ class _Pos:
     stop_price:  float
     entry_bar:   int
     shares:      int
-    peak:        float        # highest high since entry (for trailing stops)
+    peak:        float        # highest high since entry (trailing stops)
     trail_pct:   float        # 0.0 for a fixed ATR stop
 
 
@@ -79,9 +81,9 @@ class Trade:
     hold_days:    int   = 0
 
 
-# ── Data + indicators ─────────────────────────────────────────────────────────
+# ── Prepare data + indicators once ────────────────────────────────────────────
 
-def _load_data(symbols: list[str], years: int):
+def prepare(symbols: list[str], years: int) -> dict:
     end   = datetime.now(timezone.utc)
     start = end - timedelta(days=years * 365 + 100)
     logger.info(f"Downloading {len(symbols)} symbols | {start.date()} → {end.date()}")
@@ -89,15 +91,11 @@ def _load_data(symbols: list[str], years: int):
                       interval="1d", auto_adjust=True, progress=False, threads=True)
     if isinstance(raw.columns, pd.MultiIndex):
         opens, highs, lows, closes = raw["Open"], raw["High"], raw["Low"], raw["Close"]
-    else:  # single-symbol fallback
+    else:
         s = symbols[0]
-        rename = lambda col: raw[[col]].rename(columns={col: s})
-        opens, highs, lows, closes = rename("Open"), rename("High"), rename("Low"), rename("Close")
-    logger.info(f"Data: {closes.shape[0]} trading days × {closes.shape[1]} symbols")
-    return opens, highs, lows, closes
+        rn = lambda col: raw[[col]].rename(columns={col: s})
+        opens, highs, lows, closes = rn("Open"), rn("High"), rn("Low"), rn("Close")
 
-
-def _build_indicators(opens, highs, lows, closes, symbols):
     idx = closes.index
     sma50, rsi2, atr14, tradeable = {}, {}, {}, []
     warmup_min = config.SMA_DAILY + 10
@@ -114,46 +112,42 @@ def _build_indicators(opens, highs, lows, closes, symbols):
         rsi2[sym]  = rsi(c, config.RSI_PERIOD).reindex(idx).values
         atr14[sym] = atr(h, l, c, config.ATR_PERIOD).reindex(idx).values
         tradeable.append(sym)
-    logger.info(f"Indicators ready: {len(tradeable)} / {len(symbols)} symbols tradeable.")
-    return sma50, rsi2, atr14, tradeable
+    logger.info(f"Data: {closes.shape[0]} days × {closes.shape[1]} symbols | "
+                f"{len(tradeable)} tradeable.")
+    return {
+        "dates": idx, "n": len(idx), "tradeable": tradeable,
+        "o": {s: opens[s].reindex(idx).values  for s in tradeable},
+        "h": {s: highs[s].reindex(idx).values  for s in tradeable},
+        "l": {s: lows[s].reindex(idx).values   for s in tradeable},
+        "c": {s: closes[s].reindex(idx).values for s in tradeable},
+        "sma50": sma50, "rsi2": rsi2, "atr14": atr14,
+        "sec": {s: sectors.sector_of(s) for s in tradeable},
+    }
 
 
-# ── Portfolio engine ──────────────────────────────────────────────────────────
+# ── Engine: run over bar range [lo, hi) ───────────────────────────────────────
 
-def run(symbols, stop_kind, stop_param, variant, max_positions, max_per_sector,
-        years, initial_equity):
-    """stop_kind: 'atr' (stop_param = ATR multiple) or 'trail' (stop_param = pct)."""
+def run_engine(prep, stop_kind, stop_param, variant, lo, hi,
+               max_positions, max_per_sector, initial_equity):
     slip = config.SLIPPAGE_PCT
-    logger.info(f"\nPortfolio backtest | {variant} | MaxPos {max_positions} | "
-                f"MaxPerSector {max_per_sector} | NotionalCap {config.MAX_POSITION_PCT:.0%}")
+    o, h, l, c = prep["o"], prep["h"], prep["l"], prep["c"]
+    sma50, rsi2, atr14 = prep["sma50"], prep["rsi2"], prep["atr14"]
+    sec_of, tradeable, dates = prep["sec"], prep["tradeable"], prep["dates"]
 
-    opens, highs, lows, closes = _load_data(symbols, years)
-    sma50, rsi2, atr14, tradeable = _build_indicators(opens, highs, lows, closes, symbols)
-
-    o_arr = {s: opens[s].reindex(closes.index).values  for s in tradeable}
-    h_arr = {s: highs[s].reindex(closes.index).values  for s in tradeable}
-    l_arr = {s: lows[s].reindex(closes.index).values   for s in tradeable}
-    c_arr = {s: closes[s].reindex(closes.index).values for s in tradeable}
-    sec_of = {s: sectors.sector_of(s) for s in tradeable}
-
-    dates      = closes.index
-    n          = len(dates)
-    equity     = initial_equity
-    peak_eq    = initial_equity
-    max_dd     = 0.0
+    equity = peak_eq = initial_equity
+    max_dd = 0.0
     eq_curve: list[float]      = []
     positions: dict[str, _Pos] = {}
-    pending: list[tuple]       = []   # (symbol, signal_rsi, signal_atr)
-    all_trades: list[Trade]    = []
-    start_bar  = config.SMA_DAILY + 5
+    pending: list[tuple]       = []
+    trades: list[Trade]        = []
 
     def sector_load(sec, extra):
         return sum(1 for p in positions.values() if p.sector == sec) + extra.get(sec, 0)
 
-    for i in range(start_bar, n):
+    for i in range(lo, hi):
         date_str = str(dates[i].date())
 
-        # 1. Execute yesterday's pending entries at today's open (most oversold first)
+        # 1. Fill yesterday's signals at today's open (most oversold first)
         if pending:
             added: dict[str, int] = defaultdict(int)
             for sym, sig_rsi, sig_atr in sorted(pending, key=lambda x: x[1]):
@@ -164,7 +158,7 @@ def run(symbols, stop_kind, stop_param, variant, max_positions, max_per_sector,
                 sec = sec_of[sym]
                 if sector_load(sec, added) >= max_per_sector:
                     continue
-                open_px = o_arr[sym][i]
+                open_px = o[sym][i]
                 if np.isnan(open_px) or open_px <= 0:
                     continue
                 entry_px = open_px * (1 + slip)
@@ -172,38 +166,34 @@ def run(symbols, stop_kind, stop_param, variant, max_positions, max_per_sector,
                     if np.isnan(sig_atr):
                         continue
                     stop_dist = stop_param * sig_atr
-                else:  # trail
+                else:
                     stop_dist = entry_px * stop_param
-                stop_px = entry_px - stop_dist
                 if stop_dist <= 0:
                     continue
                 shares = int(equity * config.RISK_PER_TRADE / stop_dist)
-                shares = min(shares, int(equity * config.MAX_POSITION_PCT / entry_px))  # notional cap
+                shares = min(shares, int(equity * config.MAX_POSITION_PCT / entry_px))
                 if shares <= 0:
                     continue
-                positions[sym] = _Pos(sym, sec, date_str, entry_px, stop_px, i, shares,
-                                      peak=entry_px,
+                positions[sym] = _Pos(sym, sec, date_str, entry_px, entry_px - stop_dist, i,
+                                      shares, peak=entry_px,
                                       trail_pct=stop_param if stop_kind == "trail" else 0.0)
                 added[sec] += 1
         pending = []
 
-        # 2. Check exits for open positions
+        # 2. Exits (stop tested here reflects prior-bar highs only)
         for sym in list(positions.keys()):
             pos       = positions[sym]
             days_held = i - pos.entry_bar
-            low_px    = l_arr[sym][i]
-            high_px   = h_arr[sym][i]
-            open_px   = o_arr[sym][i]
-            prev_rsi  = rsi2[sym][i - 1]
-            prev2_rsi = rsi2[sym][i - 2]
+            low_px, high_px, open_px = l[sym][i], h[sym][i], o[sym][i]
+            prev_rsi, prev2_rsi = rsi2[sym][i - 1], rsi2[sym][i - 2]
             if np.isnan(low_px) or np.isnan(open_px):
                 continue
 
-            # The stop level for this bar reflects highs through the PRIOR bar
-            # (set at the end of the last iteration) — no same-bar lookahead.
             exit_px = exit_reason = None
             if low_px <= pos.stop_price:                                  # hard / trailing stop
-                exit_px, exit_reason = pos.stop_price, "stop_loss"
+                # Gap-through: if the bar opened below the stop, fill at the open.
+                exit_px = min(pos.stop_price, open_px)
+                exit_reason = "stop_loss"
             elif days_held >= config.MAX_HOLD_DAYS:                       # time stop
                 exit_px, exit_reason = open_px, "time_stop"
             elif (not np.isnan(prev_rsi) and not np.isnan(prev2_rsi)      # RSI crossback below 70
@@ -214,14 +204,15 @@ def run(symbols, stop_kind, stop_param, variant, max_positions, max_per_sector,
             if exit_px is not None:
                 exit_px *= (1 - slip)
                 pnl_d = (exit_px - pos.entry_price) * pos.shares
-                pnl_p = (exit_px - pos.entry_price) / pos.entry_price * 100
                 equity += pnl_d
-                all_trades.append(Trade(
+                trades.append(Trade(
                     symbol=sym, sector=pos.sector, stop_variant=variant,
                     entry_date=pos.entry_date, entry_price=round(pos.entry_price, 4),
                     exit_date=date_str, exit_price=round(exit_px, 4), shares=pos.shares,
                     exit_reason=exit_reason, stop_price=round(pos.stop_price, 4),
-                    pnl_dollars=round(pnl_d, 2), pnl_pct=round(pnl_p, 2), hold_days=days_held,
+                    pnl_dollars=round(pnl_d, 2),
+                    pnl_pct=round((exit_px - pos.entry_price) / pos.entry_price * 100, 2),
+                    hold_days=days_held,
                 ))
                 del positions[sym]
             elif pos.trail_pct and not np.isnan(high_px):
@@ -229,56 +220,50 @@ def run(symbols, stop_kind, stop_param, variant, max_positions, max_per_sector,
                 pos.peak = max(pos.peak, high_px)
                 pos.stop_price = max(pos.stop_price, pos.peak * (1 - pos.trail_pct))
 
-        # 3. Scan for new entry signals (RSI crossback above 10), fill at next open
+        # 3. Scan for new signals at this close → fill next open
         if len(positions) < max_positions:
-            new_signals = []
+            sig = []
             for sym in tradeable:
                 if sym in positions:
                     continue
                 cur_rsi, prev_rsi = rsi2[sym][i], rsi2[sym][i - 1]
-                c, s, a = c_arr[sym][i], sma50[sym][i], atr14[sym][i]
-                if np.isnan(cur_rsi) or np.isnan(prev_rsi) or np.isnan(a) or np.isnan(c):
+                cc, ss, aa = c[sym][i], sma50[sym][i], atr14[sym][i]
+                if np.isnan(cur_rsi) or np.isnan(prev_rsi) or np.isnan(aa) or np.isnan(cc):
                     continue
                 crossback = prev_rsi <= config.RSI_ENTRY_THRESHOLD and cur_rsi > config.RSI_ENTRY_THRESHOLD
-                trend_ok  = (not np.isnan(s) and c > s) if config.USE_TREND_FILTER else True
+                trend_ok  = (not np.isnan(ss) and cc > ss) if config.USE_TREND_FILTER else True
                 if crossback and trend_ok:
-                    new_signals.append((sym, cur_rsi, a))
-            pending = new_signals
+                    sig.append((sym, cur_rsi, aa))
+            pending = sig
 
         # 4. Mark-to-market + drawdown
-        mtm = equity + sum((c_arr[s][i] - p.entry_price) * p.shares
-                           for s, p in positions.items() if not np.isnan(c_arr[s][i]))
+        mtm = equity + sum((c[s][i] - p.entry_price) * p.shares
+                           for s, p in positions.items() if not np.isnan(c[s][i]))
         eq_curve.append(mtm)
         peak_eq = max(peak_eq, mtm)
         max_dd  = max(max_dd, (peak_eq - mtm) / peak_eq * 100)
 
-    return all_trades, _summarize(all_trades, eq_curve, equity, initial_equity,
-                                  dates, start_bar, variant, max_dd)
+    return trades, _summarize(trades, equity, initial_equity, dates, lo, hi, variant, max_dd)
 
 
-# ── Stats + reporting ─────────────────────────────────────────────────────────
+# ── Stats ─────────────────────────────────────────────────────────────────────
 
-def _summarize(trades, eq_curve, equity, init_eq, dates, start_bar, variant, max_dd):
+def _summarize(trades, equity, init_eq, dates, lo, hi, variant, max_dd):
     winners = [t for t in trades if t.pnl_dollars > 0]
     losers  = [t for t in trades if t.pnl_dollars <= 0]
     win_rate = len(winners) / len(trades) * 100 if trades else 0
-    avg_win  = sum(t.pnl_pct for t in winners) / len(winners) if winners else 0
-    avg_loss = sum(t.pnl_pct for t in losers)  / len(losers)  if losers  else 0
     gw = sum(t.pnl_dollars for t in winners); gl = abs(sum(t.pnl_dollars for t in losers))
     pf = gw / gl if gl > 0 else float("inf")
     tot_ret = (equity - init_eq) / init_eq * 100
-    n_years = (dates[-1] - dates[start_bar]).days / 365.25
+    n_years = (dates[hi - 1] - dates[lo]).days / 365.25
     cagr = ((equity / init_eq) ** (1 / n_years) - 1) * 100 if n_years > 0 and equity > 0 else 0
     avg_hold = sum(t.hold_days for t in trades) / len(trades) if trades else 0
-    ex = {r: sum(1 for t in trades if t.exit_reason == r) for r in ("rsi_exit", "stop_loss", "time_stop")}
     return {
-        "variant": variant, "total_trades": len(trades),
-        "win_rate_pct": round(win_rate, 1), "avg_win_pct": round(avg_win, 2),
-        "avg_loss_pct": round(avg_loss, 2), "profit_factor": round(pf, 2),
-        "cagr_pct": round(cagr, 2), "total_return_pct": round(tot_ret, 2),
-        "max_drawdown_pct": round(max_dd, 2), "avg_hold_days": round(avg_hold, 1),
-        "rsi_exits": ex["rsi_exit"], "stop_exits": ex["stop_loss"], "time_exits": ex["time_stop"],
-        "final_equity": round(equity, 2),
+        "variant": variant, "start": str(dates[lo].date()), "end": str(dates[hi - 1].date()),
+        "total_trades": len(trades), "win_rate_pct": round(win_rate, 1),
+        "profit_factor": round(pf, 2), "cagr_pct": round(cagr, 2),
+        "total_return_pct": round(tot_ret, 2), "max_drawdown_pct": round(max_dd, 2),
+        "avg_hold_days": round(avg_hold, 1), "final_equity": round(equity, 2),
     }
 
 
@@ -293,7 +278,6 @@ def per_symbol_stats(trades):
             "symbol": sym, "sector": sec, "stop_variant": variant, "total_trades": len(ts),
             "win_rate_pct": round(len(winners) / len(ts) * 100, 1) if ts else 0,
             "total_pnl": round(sum(t.pnl_dollars for t in ts), 2),
-            "avg_hold_days": round(sum(t.hold_days for t in ts) / len(ts), 1) if ts else 0,
         })
     return sorted(rows, key=lambda r: r["total_pnl"], reverse=True)
 
@@ -304,24 +288,69 @@ def _save(rows, filename):
     dicts = [r if isinstance(r, dict) else asdict(r) for r in rows]
     with open(filename, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=dicts[0].keys())
-        w.writeheader()
-        w.writerows(dicts)
+        w.writeheader(); w.writerows(dicts)
     logger.info(f"Saved → {filename} ({len(rows):,} rows)")
 
 
-def _print_comparison(summaries):
-    print(f"\n{'='*86}\n  STOP-METHOD COMPARISON  ({config.MAX_POSITIONS} pos / {config.MAX_PER_SECTOR} "
-          f"per sector / {config.MAX_POSITION_PCT:.0%} notional cap)\n{'='*86}")
-    print(f"  {'Variant':<12}{'Return':>9}{'CAGR':>8}{'MaxDD':>8}{'Win%':>7}{'PF':>6}{'Trades':>8}{'Hold':>6}")
-    print("  " + "-" * 82)
-    for s in summaries:
-        print(f"  {s['variant']:<12}{s['total_return_pct']:>+8.1f}%{s['cagr_pct']:>+7.2f}%"
-              f"{s['max_drawdown_pct']:>7.1f}%{s['win_rate_pct']:>7.1f}{s['profit_factor']:>6.2f}"
-              f"{s['total_trades']:>8,}{s['avg_hold_days']:>6.1f}")
-    print(f"{'='*86}\n")
+def _row(label, s):
+    return (f"  {label:<10}{s['variant']:<10}{s['start']}→{s['end']}"
+            f"{s['total_return_pct']:>+8.1f}%{s['cagr_pct']:>+7.2f}%{s['max_drawdown_pct']:>7.1f}%"
+            f"{s['win_rate_pct']:>7.1f}{s['profit_factor']:>6.2f}{s['total_trades']:>7,}")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+def _header():
+    print(f"  {'Period':<10}{'Variant':<10}{'Window':<23}{'Return':>9}{'CAGR':>7}"
+          f"{'MaxDD':>8}{'Win%':>7}{'PF':>6}{'Trades':>7}")
+    print("  " + "-" * 92)
+
+
+# ── Drivers ───────────────────────────────────────────────────────────────────
+
+VARIANTS = [
+    ("atr",   config.STOP_MULT_B, f"ATR-{config.STOP_MULT_B}x"),
+    ("trail", 0.01,               "Trail-1%"),
+    ("trail", 0.02,               "Trail-2%"),
+]
+
+
+def validate_oos(prep, args):
+    """Split the window in half: train on the first half, test on the second."""
+    n   = prep["n"]
+    mid = (START_BAR + n) // 2
+    print(f"\n{'='*96}\n  OUT-OF-SAMPLE VALIDATION  ({config.MAX_POSITIONS} pos / "
+          f"{config.MAX_PER_SECTOR} per sector / {config.MAX_POSITION_PCT:.0%} cap)\n{'='*96}")
+    _header()
+    all_trades, all_sum = [], []
+    for kind, param, label in VARIANTS:
+        kw = dict(max_positions=args.max_positions, max_per_sector=args.max_per_sector,
+                  initial_equity=args.equity)
+        t_is, s_is = run_engine(prep, kind, param, label, START_BAR, mid, **kw)
+        t_oos, s_oos = run_engine(prep, kind, param, label, mid, n, **kw)
+        print(_row("In-samp", s_is))
+        print(_row("Out-samp", s_oos))
+        print("  " + "·" * 92)
+        all_trades += t_is + t_oos
+        all_sum += [{"period": "in_sample", **s_is}, {"period": "out_sample", **s_oos}]
+    print(f"{'='*96}\n")
+    return all_trades, all_sum
+
+
+def compare_full(prep, args):
+    n = prep["n"]
+    full = [("atr", config.STOP_MULT_A, f"ATR-{config.STOP_MULT_A}x")] + VARIANTS + \
+           [("trail", 0.05, "Trail-5%")]
+    print(f"\n{'='*96}\n  FULL-PERIOD COMPARISON\n{'='*96}")
+    _header()
+    all_trades, all_sum = [], []
+    for kind, param, label in full:
+        t, s = run_engine(prep, kind, param, label, START_BAR, n,
+                          max_positions=args.max_positions, max_per_sector=args.max_per_sector,
+                          initial_equity=args.equity)
+        print(_row("Full", s))
+        all_trades += t; all_sum.append(s)
+    print(f"{'='*96}\n")
+    return all_trades, all_sum
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Portfolio-level MeansRev backtest")
@@ -329,32 +358,17 @@ if __name__ == "__main__":
     parser.add_argument("--max-positions",  type=int,   default=config.MAX_POSITIONS)
     parser.add_argument("--max-per-sector", type=int,   default=config.MAX_PER_SECTOR)
     parser.add_argument("--equity",         type=float, default=100_000.0)
+    parser.add_argument("--compare", action="store_true",
+                        help="Full-period comparison of all stop variants (default: OOS validation).")
     args = parser.parse_args()
 
     if config.USE_TREND_FILTER or config.USE_REGIME_FILTER:
         logger.warning("Weekly gate is ON — daily-only engine; results approximate. Use backtest.py.")
 
-    # (stop_kind, stop_param, label)
-    VARIANTS = [
-        ("atr",   config.STOP_MULT_A, f"ATR-{config.STOP_MULT_A}x"),
-        ("atr",   config.STOP_MULT_B, f"ATR-{config.STOP_MULT_B}x"),
-        ("trail", 0.01,               "Trail-1%"),
-        ("trail", 0.02,               "Trail-2%"),
-        ("trail", 0.05,               "Trail-5%"),
-    ]
+    prep = prepare(config.SYMBOLS, args.years)
+    all_trades, all_sum = compare_full(prep, args) if args.compare else validate_oos(prep, args)
 
-    all_trades, all_summaries = [], []
-    for kind, param, label in VARIANTS:
-        trades, summary = run(
-            symbols=config.SYMBOLS, stop_kind=kind, stop_param=param, variant=label,
-            max_positions=args.max_positions, max_per_sector=args.max_per_sector,
-            years=args.years, initial_equity=args.equity,
-        )
-        all_trades.extend(trades)
-        all_summaries.append(summary)
-
-    _print_comparison(all_summaries)
     _save(all_trades,                   "backtest_portfolio_trades.csv")
-    _save(all_summaries,                "backtest_portfolio_summary.csv")
+    _save(all_sum,                      "backtest_portfolio_summary.csv")
     _save(per_symbol_stats(all_trades), "backtest_portfolio_by_symbol.csv")
     print("✅ Done. → backtest_portfolio_{trades,summary,by_symbol}.csv")
