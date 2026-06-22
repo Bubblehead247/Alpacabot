@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import schedule
 
 import config
+import eval_checkpoint
 import executor
 import notifier
 import position_tracker as pt
@@ -209,6 +210,12 @@ def status_report():
     """Log a snapshot of open positions and their current age."""
     if _skip_if_closed("STATUS"):
         return
+
+    # Paper-trading evaluation checkpoint: one-time push when 25 closed trades
+    # accumulate since the v1.4 go-live (see eval_checkpoint.py). Never raises.
+    cp = eval_checkpoint.check_and_notify()
+    logger.info(f"STATUS | Eval checkpoint: {cp['new']}/{cp['target']} trades"
+                + ("  ✅ REACHED — review fidelity" if cp["reached"] else ""))
 
     positions = pt.all_positions()
     if not positions:

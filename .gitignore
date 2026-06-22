@@ -18,6 +18,7 @@ regime_buckets.csv
 screener_results.csv
 _bars_cache.pkl
 positions.json
+eval_checkpoint.json
 backtest_results_*.json
 _grid_daily_cache.pkl
 _grid_mtf_cache.pkl
