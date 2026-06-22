@@ -15,22 +15,36 @@ API_KEY    = os.getenv("ALPACA_API_KEY", "YOUR_KEY_HERE")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "YOUR_SECRET_HERE")
 PAPER      = True   # Set False when going live with real money
 
-# ── Trading Universe (top 30 sideways picks from screener.py) ─────────────────
-# Replaces the original 16-ETF list. These are the highest-scoring range-bound
-# (low-trend) names from a full-universe screener run; see screener.py and
-# screener_results.csv. NOTE: the regime ADX filter below is OFF — these names
-# have low ADX and would be blocked by the 20–25 band.
+# ── Trading Universe (Connors-aligned liquid ETFs) ────────────────────────────
+# Switched from the 30-name SIDEWAYS screen to a liquid ETF set (Larry Connors'
+# canonical RSI(2) instruments). Rationale validated in backtest_connors.py /
+# backtest_connors_pit.py: the sideways screen is the OPPOSITE of what Connors'
+# dip-in-an-uptrend edge needs, and individual mega-caps carry survivorship bias.
+# These ETFs are survivorship-clean, deeply liquid, and already sector-mapped in
+# sectors.py (for the MAX_PER_SECTOR cap). To revert, restore the list above.
 SYMBOLS = [
-    "SPGI", "EFA", "MA", "LQD", "XBI", "XLI", "IEFA", "XLE", "TDG", "SCHW",
-    "VGK", "EMB", "IDXX", "DIS", "EOG", "AMGN", "HYG", "VCLT", "TLT", "V",
-    "LIN", "CVX", "XOM", "EZU", "FANG", "UBER", "XLP", "MRK", "ABNB", "BA",
+    "SPY", "QQQ", "IWM", "DIA",                  # broad index (→ Broad/Index)
+    "XLE", "XLF", "XLK", "XLV", "XLU",           # sector ETFs (→ their GICS sector)
+    "GLD", "TLT",                                # commodity / long bonds
 ]
 
 # ── Indicator Parameters ──────────────────────────────────────────────────────
 RSI_PERIOD          = 2
-RSI_ENTRY_THRESHOLD = 10.0   # Entry fires when RSI(2) crosses BACK ABOVE this
+RSI_ENTRY_THRESHOLD = 10.0   # Entry threshold on RSI(2) — see ENTRY_MODE
 RSI_EXIT_THRESHOLD  = 70.0   # Exit fires when RSI(2) crosses back below this
-SMA_DAILY           = 50     # Daily SMA — price must be above this to enter
+# Entry trigger style:
+#   "oversold"  = Larry Connors: enter while RSI(2) is STILL below the threshold
+#                 (buy the dip). Validated as the stronger entry (backtest_connors).
+#   "crossback" = legacy live behaviour: enter only once RSI(2) crosses back ABOVE
+#                 the threshold (buy the turn).
+ENTRY_MODE          = "oversold"
+SMA_DAILY           = 50     # Daily SMA — legacy daily gate (only used by weekly trend filter)
+# Connors trend regime: long only when price closes ABOVE the daily 200-day SMA.
+# This is the single biggest edge lever in testing — it puts back the "dip in an
+# uptrend" regime the sideways universe had removed. Distinct from the weekly
+# SMA50/200 gate (USE_TREND_FILTER), which stays OFF.
+SMA_DAILY_TREND        = 200
+USE_DAILY_SMA200_FILTER = True
 SMA_WEEKLY_FAST     = 50     # Weekly SMA — trend gate (1-year)
 SMA_WEEKLY_SLOW     = 200    # Weekly SMA — trend gate (4-year)
 # Trend filter: when ON, entries require price above the daily SMA50 and weekly
@@ -46,7 +60,7 @@ VOLUME_SPIKE_MULT   = 1.5    # When the filter is ON: volume must exceed this ×
 # signals and cuts ~12yr return from +51% to +11%. Left OFF by default; flip to
 # True to re-test. Volume is still computed and logged either way.
 USE_VOLUME_FILTER   = False
-LOOKBACK_DAYS       = 100    # Daily bars (SMA50=50 + ATR14 + volume20 + buffer)
+LOOKBACK_DAYS       = 260    # Daily bars — must exceed SMA_DAILY_TREND(200) + buffer for the Connors trend gate
 WEEKLY_LOOKBACK_WEEKS = 220  # Weekly bars (SMA200=200 + buffer)
 
 # ── Risk Management ───────────────────────────────────────────────────────────

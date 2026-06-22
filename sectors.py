@@ -61,6 +61,14 @@ BROAD_ETF = {
     "EFA", "IEFA", "VGK", "VEA", "VWO", "EEM", "ACWI",
 }
 
+# Non-equity ETFs get their own buckets so they don't all collapse into one cap
+# group (and aren't mislabelled "Unknown"). Used by the Connors ETF universe.
+OTHER_ETF = {
+    "GLD": "Commodity", "SLV": "Commodity",
+    "TLT": "Fixed Income", "IEF": "Fixed Income", "LQD": "Fixed Income",
+    "HYG": "Fixed Income", "AGG": "Fixed Income", "BND": "Fixed Income",
+}
+
 CSV_FILE = Path(__file__).resolve().parent / "sectors.csv"
 
 
@@ -82,6 +90,8 @@ def sector_of(symbol: str) -> str:
         return SECTOR_ETF[symbol]
     if symbol in BROAD_ETF:
         return BROAD_BUCKET
+    if symbol in OTHER_ETF:
+        return OTHER_ETF[symbol]
     return _PERSISTED.get(symbol, UNKNOWN)
 
 

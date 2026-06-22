@@ -3,8 +3,11 @@ scanner.py — Fetches daily and weekly OHLCV bars and evaluates entry/exit sign
 
 Entry (ALL must pass):
   Weekly gate:   Close > SMA(50,W)  AND  Close > SMA(200,W)
-  Daily trend:   Close > SMA(50,D)
-  RSI signal:    RSI(2) crossed back ABOVE 10 today (prev <= 10, now > 10)
+                 (only enforced when config.USE_TREND_FILTER is True — OFF)
+  Daily trend:   Close > SMA(200,D)  — Connors regime gate
+                 (only enforced when config.USE_DAILY_SMA200_FILTER is True)
+  RSI signal:    config.ENTRY_MODE — "oversold" = RSI(2) < 10 (Connors, buy the
+                 dip); "crossback" = RSI(2) crossed back above 10 (legacy)
   Volume:        Optional — today's volume > 1.5× the 20-day average
                  (only enforced when config.USE_VOLUME_FILTER is True)
   Regime:        Optional — weekly ADX in [REGIME_ADX_MIN, REGIME_ADX_MAX)
@@ -96,21 +99,32 @@ def evaluate_symbol(symbol: str) -> dict:
     volume = bars["volume"]
 
     sma50_d  = sma(close, config.SMA_DAILY)
+    sma200_d = sma(close, config.SMA_DAILY_TREND)
     rsi2     = rsi(close, config.RSI_PERIOD)
     atr14    = atr(high, low, close, config.ATR_PERIOD)
     vol_ma20 = sma(volume, config.VOLUME_MA_PERIOD)
 
     last_close    = round(float(close.iloc[-1]),   2)
     last_sma50_d  = round(float(sma50_d.iloc[-1]), 2)
+    last_sma200_d = float(sma200_d.iloc[-1])   # NaN if < 200 bars available
     last_rsi2     = round(float(rsi2.iloc[-1]),    2)
     prev_rsi2     = round(float(rsi2.iloc[-2]),    2)
     last_atr      = round(float(atr14.iloc[-1]),   2)
     last_volume   = int(volume.iloc[-1])
     last_vol_ma20 = float(vol_ma20.iloc[-1])
 
-    above_daily_sma50 = last_close > last_sma50_d
-    # Entry: RSI(2) was <= 10 last bar, now crossed back above 10
+    above_daily_sma50  = last_close > last_sma50_d
+    # Connors trend regime: long only above the daily 200-day SMA. A NaN SMA200
+    # (too few bars) fails closed — no entry — which is the conservative choice.
+    above_daily_sma200 = (not pd.isna(last_sma200_d)) and (last_close > last_sma200_d)
+    last_sma200_d      = round(last_sma200_d, 2) if not pd.isna(last_sma200_d) else 0.0
+
+    # Entry trigger style (config.ENTRY_MODE):
+    #   oversold  — Connors: RSI(2) still below the threshold (buy the dip)
+    #   crossback — legacy: RSI(2) crossed back above the threshold (buy the turn)
     rsi_crossed_above = (prev_rsi2 <= config.RSI_ENTRY_THRESHOLD) and (last_rsi2 > config.RSI_ENTRY_THRESHOLD)
+    rsi_oversold      = last_rsi2 < config.RSI_ENTRY_THRESHOLD
+    rsi_entry_trigger = rsi_oversold if config.ENTRY_MODE == "oversold" else rsi_crossed_above
     # Exit: RSI(2) was >= 70 last bar, now crossed back below 70
     rsi_crossed_below = (prev_rsi2 >= config.RSI_EXIT_THRESHOLD)  and (last_rsi2 < config.RSI_EXIT_THRESHOLD)
     volume_spike      = last_volume > (config.VOLUME_SPIKE_MULT * last_vol_ma20)
@@ -160,6 +174,8 @@ def evaluate_symbol(symbol: str) -> dict:
     # structural exit is disabled too — otherwise it would dump sideways names
     # that naturally sit below their 4-year average.
     trend_ok           = (weekly_trend_ok and above_daily_sma50) if config.USE_TREND_FILTER else True
+    # Connors daily 200-SMA trend gate (see config.USE_DAILY_SMA200_FILTER).
+    daily_trend_ok     = above_daily_sma200 if config.USE_DAILY_SMA200_FILTER else True
     # Volume spike is an optional confirmation (see config.USE_VOLUME_FILTER).
     volume_ok          = volume_spike if config.USE_VOLUME_FILTER else True
     # Regime gate: weekly ADX must sit in the moderate-trend band (see
@@ -167,7 +183,7 @@ def evaluate_symbol(symbol: str) -> dict:
     # 0.0 → fails the band, blocking entry (conservative — matches weekly gate).
     regime_ok          = (config.REGIME_ADX_MIN <= last_weekly_adx < config.REGIME_ADX_MAX
                           ) if config.USE_REGIME_FILTER else True
-    entry_signal       = trend_ok and rsi_crossed_above and volume_ok and regime_ok
+    entry_signal       = trend_ok and daily_trend_ok and rsi_entry_trigger and volume_ok and regime_ok
     exit_signal        = rsi_crossed_below
     weekly_exit_signal = (not above_weekly_sma200) if config.USE_TREND_FILTER else False
 
@@ -175,6 +191,8 @@ def evaluate_symbol(symbol: str) -> dict:
         "symbol":              symbol,
         "close":               last_close,
         "sma50_daily":         last_sma50_d,
+        "sma200_daily":        last_sma200_d,
+        "above_daily_sma200":  above_daily_sma200,
         "sma50_weekly":        last_weekly_sma50,
         "sma200_weekly":       last_weekly_sma200,
         "weekly_adx":          last_weekly_adx,
@@ -200,10 +218,11 @@ def evaluate_symbol(symbol: str) -> dict:
     logger.info(
         f"[{symbol}] Close={last_close} | "
         f"SMA50d={last_sma50_d} above={above_daily_sma50} | "
+        f"SMA200d={last_sma200_d} above200d={above_daily_sma200} | "
         f"SMA50w={last_weekly_sma50} SMA200w={last_weekly_sma200} "
         f"above50w={above_weekly_sma50} above200w={above_weekly_sma200} | "
         f"ADXw={last_weekly_adx} regime_ok={regime_ok} | "
-        f"RSI2={last_rsi2:.2f} prev={prev_rsi2:.2f} xabove={rsi_crossed_above} | "
+        f"RSI2={last_rsi2:.2f} prev={prev_rsi2:.2f} trigger={rsi_entry_trigger}({config.ENTRY_MODE}) | "
         f"Vol={last_volume:,} VolMA={last_vol_ma20:,.0f} spike={volume_spike} | "
         f"ATR={last_atr:.2f} Stop_A={stop_a} Stop_B={stop_b} | "
         f"Entry={entry_signal} RsiExit={exit_signal} WeeklyExit={weekly_exit_signal}"

@@ -191,6 +191,7 @@ class PrecomputedSymbol:
     rsi2:     np.ndarray
     atr14:    np.ndarray
     sma50_d:  np.ndarray
+    sma200_d: np.ndarray
     vol_ma:   np.ndarray
     w50_d:    np.ndarray
     w200_d:   np.ndarray
@@ -203,6 +204,7 @@ def precompute_symbol(symbol: str, bars: pd.DataFrame) -> PrecomputedSymbol:
     """Compute indicators once per symbol and return numpy arrays for the loop."""
     close_s = bars["close"]
     sma50_d = sma(close_s, config.SMA_DAILY)
+    sma200_d = sma(close_s, config.SMA_DAILY_TREND)
     rsi2    = rsi(close_s, config.RSI_PERIOD)
     atr14   = atr(bars["high"], bars["low"], close_s, config.ATR_PERIOD)
     vol_ma  = sma(bars["volume"], config.VOLUME_MA_PERIOD)
@@ -212,8 +214,11 @@ def precompute_symbol(symbol: str, bars: pd.DataFrame) -> PrecomputedSymbol:
     w200_np = w200_d.to_numpy(dtype=float)
     n = len(bars)
 
-    # Warmup: need enough bars for daily SMA50, ATR, and volume MA.
-    warmup  = max(config.SMA_DAILY, config.ATR_PERIOD, config.VOLUME_MA_PERIOD) + 5
+    # Warmup: need enough bars for daily SMA50/SMA200, ATR, and volume MA.
+    warmup_smas = max(config.SMA_DAILY, config.ATR_PERIOD, config.VOLUME_MA_PERIOD)
+    if config.USE_DAILY_SMA200_FILTER:
+        warmup_smas = max(warmup_smas, config.SMA_DAILY_TREND)
+    warmup  = warmup_smas + 5
     start_i = warmup
     # Only wait for the weekly SMA200 to warm up when a weekly gate is on —
     # otherwise that ~4-year wait needlessly discards tradeable history.
@@ -231,6 +236,7 @@ def precompute_symbol(symbol: str, bars: pd.DataFrame) -> PrecomputedSymbol:
         rsi2    = rsi2.to_numpy(dtype=float),
         atr14   = atr14.to_numpy(dtype=float),
         sma50_d = sma50_d.to_numpy(dtype=float),
+        sma200_d = sma200_d.to_numpy(dtype=float),
         vol_ma  = vol_ma.to_numpy(dtype=float),
         w50_d   = w50_d.to_numpy(dtype=float),
         w200_d  = w200_np,
@@ -254,8 +260,11 @@ def backtest_symbol(
 
     Entry (ALL must pass, signal at close → buy next open):
       Weekly gate:  Close > weekly SMA(50) AND Close > weekly SMA(200)
-      Daily trend:  Close > daily SMA(50)
-      RSI signal:   RSI(2) crossed back ABOVE 10 (prev <= 10, now > 10)
+                    (only when config.USE_TREND_FILTER — OFF)
+      Daily trend:  Close > daily SMA(200) — Connors regime gate
+                    (only when config.USE_DAILY_SMA200_FILTER)
+      RSI signal:   config.ENTRY_MODE — "oversold" RSI(2) < threshold (Connors)
+                    or "crossback" RSI(2) crossed back above threshold (legacy)
       Volume:       Optional — Volume > VOLUME_SPIKE_MULT × 20-day average
                     (only enforced when config.USE_VOLUME_FILTER is True)
 
@@ -276,6 +285,7 @@ def backtest_symbol(
     rsi2    = data.rsi2
     atr14   = data.atr14
     sma50_d = data.sma50_d
+    sma200_d = data.sma200_d
     vol_ma  = data.vol_ma
     w50_d   = data.w50_d
     w200_d  = data.w200_d
@@ -366,7 +376,16 @@ def backtest_symbol(
             weekly_ok = (cur_w200 is not None and w50 is not None
                          and day_close > w50 and day_close > cur_w200)
             above_daily_sma = day_close > sma50_d[i] if not np.isnan(sma50_d[i]) else False
+            # Entry trigger style — mirrors scanner.py config.ENTRY_MODE.
             rsi_cross_above = (prev_rsi <= config.RSI_ENTRY_THRESHOLD) and (cur_rsi > config.RSI_ENTRY_THRESHOLD)
+            rsi_oversold    = cur_rsi < config.RSI_ENTRY_THRESHOLD
+            rsi_entry_trigger = rsi_oversold if config.ENTRY_MODE == "oversold" else rsi_cross_above
+            # Connors daily 200-SMA trend gate (config.USE_DAILY_SMA200_FILTER).
+            # NaN SMA200 fails closed (no entry) — matches scanner.py.
+            if config.USE_DAILY_SMA200_FILTER:
+                daily_trend_ok = (not np.isnan(sma200_d[i])) and day_close > sma200_d[i]
+            else:
+                daily_trend_ok = True
             vol_spike = (not np.isnan(vol_ma[i])
                          and volume[i] > config.VOLUME_SPIKE_MULT * vol_ma[i])
             vol_ok = vol_spike if config.USE_VOLUME_FILTER else True
@@ -383,7 +402,7 @@ def backtest_symbol(
             # config.USE_TREND_FILTER. OFF for the sideways universe.
             trend_ok = (weekly_ok and above_daily_sma) if config.USE_TREND_FILTER else True
 
-            if (trend_ok and rsi_cross_above and vol_ok
+            if (trend_ok and daily_trend_ok and rsi_entry_trigger and vol_ok
                     and regime_ok and not np.isnan(cur_atr)):
                 # Enter at next bar's open — use next day's open if available
                 if i + 1 < n:
@@ -564,7 +583,12 @@ def run_backtest(
         # Weekly SMA(200) needs ~200 weeks (~1050 trading days) to warm up — but
         # only when a weekly gate is on. With the trend/regime gates off, a
         # daily-SMA50 warmup (~120 bars) is plenty.
-        min_bars = 1050 if (config.USE_TREND_FILTER or config.USE_REGIME_FILTER) else 120
+        if config.USE_TREND_FILTER or config.USE_REGIME_FILTER:
+            min_bars = 1050          # weekly SMA200 warmup (~200 weeks)
+        elif config.USE_DAILY_SMA200_FILTER:
+            min_bars = 260           # daily SMA200 warmup + buffer
+        else:
+            min_bars = 120
         if len(bars) < min_bars:
             logger.warning(
                 f"{symbol}: Not enough history ({len(bars)} bars) — needs ~{min_bars}. Skipping."

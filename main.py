@@ -233,9 +233,18 @@ def main():
     logger.info("=" * 70)
     logger.info("MEAN REVERSION BOT — STARTING UP")
     logger.info(f"  Universe:         {config.SYMBOLS}")
-    logger.info(f"  Weekly gate:      Close > SMA({config.SMA_WEEKLY_FAST},W) AND SMA({config.SMA_WEEKLY_SLOW},W)")
-    logger.info(f"  Daily trend:      Close > SMA({config.SMA_DAILY},D)")
-    logger.info(f"  RSI(2) entry:     crosses ABOVE {config.RSI_ENTRY_THRESHOLD} (prev <= {config.RSI_ENTRY_THRESHOLD})")
+    if config.USE_TREND_FILTER:
+        logger.info(f"  Weekly gate:      Close > SMA({config.SMA_WEEKLY_FAST},W) AND SMA({config.SMA_WEEKLY_SLOW},W)")
+    else:
+        logger.info(f"  Weekly gate:      OFF (config.USE_TREND_FILTER)")
+    if config.USE_DAILY_SMA200_FILTER:
+        logger.info(f"  Daily trend gate: Close > SMA({config.SMA_DAILY_TREND},D)  [Connors regime]")
+    else:
+        logger.info(f"  Daily trend gate: OFF (config.USE_DAILY_SMA200_FILTER)")
+    if config.ENTRY_MODE == "oversold":
+        logger.info(f"  RSI(2) entry:     OVERSOLD — RSI(2) < {config.RSI_ENTRY_THRESHOLD} (Connors, buy the dip)")
+    else:
+        logger.info(f"  RSI(2) entry:     CROSSBACK — crosses ABOVE {config.RSI_ENTRY_THRESHOLD} (legacy)")
     logger.info(f"  RSI(2) exit:      crosses below {config.RSI_EXIT_THRESHOLD} (prev >= {config.RSI_EXIT_THRESHOLD})")
     if config.USE_VOLUME_FILTER:
         logger.info(f"  Volume filter:    ON — volume > {config.VOLUME_SPIKE_MULT}× MA({config.VOLUME_MA_PERIOD})")
