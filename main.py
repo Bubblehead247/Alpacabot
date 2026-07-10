@@ -279,8 +279,22 @@ def main():
 
     logger.info("Scheduler running. Waiting for next event...")
 
+    # A job that raises is never marked as run by `schedule`, so run_pending()
+    # retries it on the next tick — transient network errors (the 2026-07-06
+    # DNS crash) heal themselves. One ntfy push per error streak, not per retry.
+    consecutive_errors = 0
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+            consecutive_errors = 0
+        except Exception as e:
+            consecutive_errors += 1
+            logger.error(
+                f"Scheduled job failed (attempt {consecutive_errors}) — retrying in 30s: {e}",
+                exc_info=True,
+            )
+            if consecutive_errors == 1:
+                notifier.send_error(f"{type(e).__name__}: {e}")
         time.sleep(30)
 
 

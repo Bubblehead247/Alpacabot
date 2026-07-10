@@ -59,6 +59,24 @@ def send_checkpoint(new_trades: int, target: int):
         logger.warning(f"ntfy checkpoint alert failed: {e}")
 
 
+def send_error(detail: str):
+    """Push alert when a scheduled job fails and the bot enters retry mode."""
+    try:
+        requests.post(
+            "https://ntfy.sh",
+            json={
+                "topic":    config.NTFY_TOPIC,
+                "title":    "❌ BOT JOB FAILED",
+                "message":  f"A scheduled job raised an error — retrying every 30s. {detail}",
+                "priority": 4,
+                "tags":     ["x"],
+            },
+            timeout=5,
+        )
+    except Exception as e:
+        logger.warning(f"ntfy error alert failed: {e}")
+
+
 def send_signal(symbol: str, rsi_value: float):
     """Fire a high-priority push alert when a live entry signal fires."""
     try:
