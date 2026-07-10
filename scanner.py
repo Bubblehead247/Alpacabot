@@ -183,7 +183,8 @@ def evaluate_symbol(symbol: str) -> dict:
     # 0.0 → fails the band, blocking entry (conservative — matches weekly gate).
     regime_ok          = (config.REGIME_ADX_MIN <= last_weekly_adx < config.REGIME_ADX_MAX
                           ) if config.USE_REGIME_FILTER else True
-    entry_signal       = trend_ok and daily_trend_ok and rsi_entry_trigger and volume_ok and regime_ok
+    prereqs_ok         = trend_ok and daily_trend_ok and volume_ok and regime_ok
+    entry_signal       = prereqs_ok and rsi_entry_trigger
     exit_signal        = rsi_crossed_below
     weekly_exit_signal = (not above_weekly_sma200) if config.USE_TREND_FILTER else False
 
@@ -209,6 +210,7 @@ def evaluate_symbol(symbol: str) -> dict:
         "stop_a":              stop_a,
         "stop_b":              stop_b,
         "active_stop":         active_stop,
+        "prereqs_ok":          prereqs_ok,
         "entry_signal":        entry_signal,
         "exit_signal":         exit_signal,
         "weekly_exit_signal":  weekly_exit_signal,

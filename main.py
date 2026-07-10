@@ -182,7 +182,7 @@ def post_close_scan():
                 _pending.append({"symbol": symbol, "action": "ENTRY", "scan_result": result})
                 logger.info(f"  📥 Queued ENTRY: {symbol} | sector={cand_sector}")
                 notifier.send_signal(symbol, result["rsi2"])
-        elif not in_position and result.get("rsi2", 100) <= 20:
+        elif not in_position and result.get("rsi2", 100) <= 20 and result.get("prereqs_ok", False):
             logger.info(f"  ⚠️  Warning zone: {symbol} RSI(2)={result['rsi2']:.1f}")
             notifier.send_warning(symbol, result["rsi2"])
 
