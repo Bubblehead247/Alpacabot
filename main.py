@@ -11,9 +11,11 @@ Logs to:   bot.log  (and stdout)
 
 To switch stop variants, change ACTIVE_STOP_MULT in config.py (1.5 or 2.5).
 """
+import json
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import schedule
 
@@ -40,7 +42,49 @@ logger = logging.getLogger(__name__)
 # ── Pending Signal Queue ──────────────────────────────────────────────────────
 # Populated by post_close_scan(), consumed by pre_open_execute().
 # Cleared at the start of each scan so stale signals never carry over.
+# Mirrored to pending.json so a restart between scan and execute can't drop
+# queued signals (learned the hard way: a 4:58 PM restart ate an SPY exit).
 _pending: list[dict] = []
+
+PENDING_FILE         = Path(__file__).resolve().parent / "pending.json"
+PENDING_MAX_AGE_DAYS = 5  # Discard a restored queue older than this — signals are stale.
+
+
+def _json_scalar(o):
+    """JSON fallback for numpy scalars coming out of pandas indicators."""
+    if hasattr(o, "item"):
+        return o.item()
+    raise TypeError(f"Not JSON serializable: {type(o)}")
+
+
+def _save_pending():
+    """Mirror the in-memory queue to disk (called after scan and after execute)."""
+    payload = {
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "actions":   _pending,
+    }
+    PENDING_FILE.write_text(json.dumps(payload, default=_json_scalar, indent=2))
+
+
+def _load_pending():
+    """Restore the queue from disk on startup, unless it has gone stale."""
+    if not PENDING_FILE.exists():
+        return
+    try:
+        payload   = json.loads(PENDING_FILE.read_text())
+        queued_at = datetime.fromisoformat(payload["queued_at"])
+        age_days  = (datetime.now(timezone.utc) - queued_at).days
+        if age_days > PENDING_MAX_AGE_DAYS:
+            logger.warning(f"pending.json is {age_days} days old — discarding stale queue.")
+            return
+        _pending.extend(payload["actions"])
+        if _pending:
+            logger.info(
+                f"Restored pending queue from pending.json: "
+                f"{[(p['symbol'], p['action']) for p in _pending]}"
+            )
+    except Exception as e:
+        logger.error(f"Failed to restore pending.json: {e}", exc_info=True)
 
 
 # ── Market-Day Guard ──────────────────────────────────────────────────────────
@@ -156,6 +200,7 @@ def post_close_scan():
                 })
                 logger.warning(f"  🔁 Re-queued EXIT (exit_pending_retry): {symbol} | close_ref=${close_ref:.2f}")
 
+    _save_pending()
     logger.info(
         f"▶  SCAN COMPLETE | Pending queue: "
         f"{[(p['symbol'], p['action']) for p in _pending]}"
@@ -190,6 +235,7 @@ def pre_open_execute():
             logger.warning(f"Unknown action type '{kind}' for {symbol} — skipping.")
 
     _pending.clear()
+    _save_pending()
     logger.info("▶  PRE-OPEN EXECUTE COMPLETE")
 
 
@@ -271,6 +317,8 @@ def main():
     logger.info(f"  Paper trading:    {config.PAPER}")
     logger.info(f"  Schedule:         Scan@{config.SCAN_TIME} | Execute@{config.EXECUTE_TIME} | Confirm@{config.FILL_CONFIRM_TIME}")
     logger.info("=" * 70)
+
+    _load_pending()
 
     schedule.every().day.at(config.SCAN_TIME).do(post_close_scan)
     schedule.every().day.at(config.SCAN_TIME).do(status_report)
