@@ -329,7 +329,9 @@ def main():
 
     # A job that raises is never marked as run by `schedule`, so run_pending()
     # retries it on the next tick — transient network errors (the 2026-07-06
-    # DNS crash) heal themselves. One ntfy push per error streak, not per retry.
+    # DNS crash) heal themselves. Alert only once the streak reaches 3 (~90s of
+    # continuous failure): single stale-connection resets self-heal on the
+    # first retry and aren't worth a page.
     consecutive_errors = 0
     while True:
         try:
@@ -341,7 +343,7 @@ def main():
                 f"Scheduled job failed (attempt {consecutive_errors}) — retrying in 30s: {e}",
                 exc_info=True,
             )
-            if consecutive_errors == 1:
+            if consecutive_errors == 3:
                 notifier.send_error(f"{type(e).__name__}: {e}")
         time.sleep(30)
 
